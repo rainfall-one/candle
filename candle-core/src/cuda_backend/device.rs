@@ -305,9 +305,19 @@ impl CudaDevice {
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         // rainfall-one fork: device-pointer coefficients for CUDA-graph-
         // capturable matmul -- see CublasOneZero's own doc comment.
+        // Deliberately NOT setting CUBLAS_POINTER_MODE_DEVICE here: cuBLAS
+        // documented (and confirmed live, 2026-08-26 -- eager decode
+        // measured 162ms/token under permanent DEVICE mode vs 47ms/token
+        // under HOST mode, the same ~3.4x regression this workspace
+        // already independently measured for CUDARC_DISABLE_ASYNC_ALLOC)
+        // fast paths for alpha=1/beta=0 rely on those being COMPILE-TIME
+        // host constants; DEVICE mode disables them for every matmul, not
+        // just captured ones. Pointer mode instead stays HOST (cuBLAS's
+        // own default) for ordinary eager execution, and is toggled to
+        // DEVICE only for the duration of an explicit capture via
+        // CudaDevice::with_cublas_device_pointer_mode -- see that method's
+        // own doc comment.
         let cublas_one_zero = CublasOneZero::new(&stream)?;
-        blas.set_pointer_mode(cudarc::cublas::sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE)
-            .w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
@@ -324,6 +334,37 @@ impl CudaDevice {
             seed_value: Arc::new(RwLock::new(299792458)),
         })
     }
+
+    /// Run `f` with this device's cuBLAS handle in
+    /// `CUBLAS_POINTER_MODE_DEVICE` (device-resident alpha/beta, required
+    /// for CUDA graph capture of matmul -- see [`CublasOneZero`]'s own doc
+    /// comment for why HOST mode, cuBLAS's default and what every OTHER
+    /// call on this device uses, cannot be captured). Pointer mode is
+    /// restored to HOST unconditionally after `f` returns, success or
+    /// error -- eager (non-captured) matmul on this device depends on
+    /// HOST mode's compile-time alpha=1/beta=0 fast path (confirmed live
+    /// 2026-08-26: permanent DEVICE mode cost eager decode a measured
+    /// ~3.4x slowdown), so this must never be left toggled on.
+    ///
+    /// # Errors
+    /// Propagates `f`'s own error. If the pointer-mode reset back to HOST
+    /// itself fails, that failure is logged to stderr rather than
+    /// propagated (mirroring this fork's `run_matmul_workspace_repro`
+    /// diagnostic's own established discipline for restoring shared
+    /// cuBLAS handle state) -- `f`'s result is still the return value.
+    pub fn with_cublas_device_pointer_mode<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        use cudarc::cublas::sys::cublasPointerMode_t;
+        self.blas.set_pointer_mode(cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE).w()?;
+        let result = f();
+        if let Err(e) = self.blas.set_pointer_mode(cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST) {
+            eprintln!(
+                "CudaDevice::with_cublas_device_pointer_mode: WARNING -- pointer mode \
+                 reset-to-HOST failed: {e} (cuBLAS handle may be left in a bad state \
+                 for subsequent eager matmul on this device)"
+            );
+        }
+        result
+    }
 }
 
 impl BackendDevice for CudaDevice {
@@ -335,9 +376,19 @@ impl BackendDevice for CudaDevice {
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         // rainfall-one fork: device-pointer coefficients for CUDA-graph-
         // capturable matmul -- see CublasOneZero's own doc comment.
+        // Deliberately NOT setting CUBLAS_POINTER_MODE_DEVICE here: cuBLAS
+        // documented (and confirmed live, 2026-08-26 -- eager decode
+        // measured 162ms/token under permanent DEVICE mode vs 47ms/token
+        // under HOST mode, the same ~3.4x regression this workspace
+        // already independently measured for CUDARC_DISABLE_ASYNC_ALLOC)
+        // fast paths for alpha=1/beta=0 rely on those being COMPILE-TIME
+        // host constants; DEVICE mode disables them for every matmul, not
+        // just captured ones. Pointer mode instead stays HOST (cuBLAS's
+        // own default) for ordinary eager execution, and is toggled to
+        // DEVICE only for the duration of an explicit capture via
+        // CudaDevice::with_cublas_device_pointer_mode -- see that method's
+        // own doc comment.
         let cublas_one_zero = CublasOneZero::new(&stream)?;
-        blas.set_pointer_mode(cudarc::cublas::sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE)
-            .w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],

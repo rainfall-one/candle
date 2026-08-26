@@ -2547,15 +2547,32 @@ unsafe fn gemm_strided_batched_f32(
     };
 
     let stream = c.stream().clone();
-    // rainfall-one fork: device-resident alpha/beta (CUBLAS_POINTER_MODE_DEVICE,
-    // set once at CudaDevice construction) instead of upstream's
-    // `&cfg.gemm.alpha as *const _` host address -- see CublasOneZero's
-    // own doc comment for why. cfg.gemm.alpha/beta themselves are unused:
-    // every call site in this module passes exactly 1.0/0.0.
-    let (alpha, _guard_alpha) = one_zero.f32_one.device_ptr(&stream);
-    let (beta, _guard_beta) = one_zero.f32_zero.device_ptr(&stream);
-    let alpha = alpha as *const f32 as *const _;
-    let beta = beta as *const f32 as *const _;
+    // rainfall-one fork: alpha/beta representation depends on the
+    // handle's CURRENT pointer mode -- HOST (cuBLAS's default, what every
+    // ordinary eager matmul on this device uses) needs a host address
+    // exactly like upstream; DEVICE (set only for the duration of
+    // CudaDevice::with_cublas_device_pointer_mode, for CUDA graph capture)
+    // needs a device pointer, or cuBLAS dereferences a host stack address
+    // as if it were device memory. Querying the handle's mode is a cheap
+    // synchronous FFI call (no kernel launch), negligible next to the
+    // GEMM itself. cfg.gemm.alpha/beta (used in the HOST branch) and
+    // one_zero.f32_one/f32_zero (used in the DEVICE branch) both hold the
+    // same values -- every call site in this module passes exactly
+    // 1.0/0.0 -- this is purely about which memory space cuBLAS is told
+    // to read them from.
+    let pointer_mode = cublas.get_pointer_mode().unwrap_or(sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST);
+    let (alpha, beta, _guard_alpha, _guard_beta) = if pointer_mode == sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE {
+        let (alpha, ga) = one_zero.f32_one.device_ptr(&stream);
+        let (beta, gb) = one_zero.f32_zero.device_ptr(&stream);
+        (alpha as *const f32 as *const _, beta as *const f32 as *const _, ga, gb)
+    } else {
+        (
+            &cfg.gemm.alpha as *const f32 as *const _,
+            &cfg.gemm.beta as *const f32 as *const _,
+            cudarc::driver::SyncOnDrop::record_event(&None, &stream),
+            cudarc::driver::SyncOnDrop::record_event(&None, &stream),
+        )
+    };
     let (a, _guard_a) = a.device_ptr(&stream);
     let (b, _guard_b) = b.device_ptr(&stream);
     let (c, _guard_c) = c.device_ptr_mut(&stream);
@@ -2599,29 +2616,44 @@ unsafe fn gemm_strided_batched_f16(
     use cudarc::driver::{DevicePtr, DevicePtrMut};
 
     let stream = c.stream().clone();
-    // rainfall-one fork: device-resident alpha/beta -- see
-    // gemm_strided_batched_f32's own comment and CublasOneZero's doc
-    // comment. cfg.gemm.alpha/beta are unused: every call site passes
-    // exactly 1.0/0.0.
+    // rainfall-one fork: alpha/beta representation depends on the
+    // handle's CURRENT pointer mode -- see gemm_strided_batched_f32's own
+    // comment for why. compute_type's own HOST-vs-DEVICE-precision choice
+    // (gemm_reduced_precision_f16) is orthogonal and unchanged from
+    // upstream; cfg.gemm.alpha/beta are unused in the DEVICE branch only
+    // (every call site passes exactly 1.0/0.0) but preserved for the HOST
+    // branch, matching upstream exactly.
+    let alpha_host = cfg.gemm.alpha;
+    let beta_host = cfg.gemm.beta;
+    let alpha_host_f32: f32 = cfg.gemm.alpha.to_f32();
+    let beta_host_f32: f32 = cfg.gemm.beta.to_f32();
+    let pointer_mode = cublas.get_pointer_mode().unwrap_or(sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST);
+    let use_device_ptr = pointer_mode == sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE;
     let (compute_type, alpha, beta, _guard_alpha, _guard_beta) = if gemm_reduced_precision_f16() {
-        let (alpha, ga) = one_zero.f16_one.device_ptr(&stream);
-        let (beta, gb) = one_zero.f16_zero.device_ptr(&stream);
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
-            alpha as *const f16 as *const _,
-            beta as *const f16 as *const _,
-            ga,
-            gb,
-        )
-    } else {
+        if use_device_ptr {
+            let (alpha, ga) = one_zero.f16_one.device_ptr(&stream);
+            let (beta, gb) = one_zero.f16_zero.device_ptr(&stream);
+            (sys::cublasComputeType_t::CUBLAS_COMPUTE_16F, alpha as *const f16 as *const _, beta as *const f16 as *const _, ga, gb)
+        } else {
+            (
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
+                (&alpha_host) as *const f16 as *const _,
+                (&beta_host) as *const f16 as *const _,
+                cudarc::driver::SyncOnDrop::record_event(&None, &stream),
+                cudarc::driver::SyncOnDrop::record_event(&None, &stream),
+            )
+        }
+    } else if use_device_ptr {
         let (alpha, ga) = one_zero.f32_one.device_ptr(&stream);
         let (beta, gb) = one_zero.f32_zero.device_ptr(&stream);
+        (sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, alpha as *const f32 as *const _, beta as *const f32 as *const _, ga, gb)
+    } else {
         (
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            alpha as *const f32 as *const _,
-            beta as *const f32 as *const _,
-            ga,
-            gb,
+            (&alpha_host_f32) as *const f32 as *const _,
+            (&beta_host_f32) as *const f32 as *const _,
+            cudarc::driver::SyncOnDrop::record_event(&None, &stream),
+            cudarc::driver::SyncOnDrop::record_event(&None, &stream),
         )
     };
 
@@ -2667,17 +2699,29 @@ unsafe fn gemm_strided_batched_bf16(
     use cudarc::driver::{DevicePtr, DevicePtrMut};
 
     let stream = c.stream().clone();
-    // rainfall-one fork: device-resident alpha/beta -- both branches here
-    // use f32-typed coefficients regardless of gemm_reduced_precision_bf16(),
-    // matching upstream's own alpha_f32/beta_f32 (bf16 has no native
-    // cublasComputeType alpha/beta representation distinct from f32). See
-    // gemm_strided_batched_f32's own comment and CublasOneZero's doc
-    // comment. cfg.gemm.alpha/beta are unused: every call site passes
-    // exactly 1.0/0.0.
-    let (alpha, _guard_alpha) = one_zero.f32_one.device_ptr(&stream);
-    let (beta, _guard_beta) = one_zero.f32_zero.device_ptr(&stream);
-    let alpha = alpha as *const f32 as *const _;
-    let beta = beta as *const f32 as *const _;
+    // rainfall-one fork: alpha/beta representation depends on the
+    // handle's CURRENT pointer mode -- see gemm_strided_batched_f32's own
+    // comment for why. Both branches here use f32-typed coefficients
+    // regardless of gemm_reduced_precision_bf16() (bf16 has no native
+    // cublasComputeType alpha/beta representation distinct from f32,
+    // matching upstream's own alpha_f32/beta_f32). cfg.gemm.alpha/beta
+    // are unused in the DEVICE branch (every call site passes exactly
+    // 1.0/0.0) but preserved for the HOST branch, matching upstream.
+    let alpha_host_f32: f32 = cfg.gemm.alpha.to_f32();
+    let beta_host_f32: f32 = cfg.gemm.beta.to_f32();
+    let pointer_mode = cublas.get_pointer_mode().unwrap_or(sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST);
+    let (alpha, beta, _guard_alpha, _guard_beta) = if pointer_mode == sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE {
+        let (alpha, ga) = one_zero.f32_one.device_ptr(&stream);
+        let (beta, gb) = one_zero.f32_zero.device_ptr(&stream);
+        (alpha as *const f32 as *const _, beta as *const f32 as *const _, ga, gb)
+    } else {
+        (
+            (&alpha_host_f32) as *const f32 as *const _,
+            (&beta_host_f32) as *const f32 as *const _,
+            cudarc::driver::SyncOnDrop::record_event(&None, &stream),
+            cudarc::driver::SyncOnDrop::record_event(&None, &stream),
+        )
+    };
     let compute_type = if gemm_reduced_precision_bf16() {
         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF
     } else {
