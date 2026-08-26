@@ -511,16 +511,9 @@ impl CudaDevice {
         // elements of type `usize`, matching `src`'s length and `T`; `dst`
         // was allocated on `self.stream`, the same stream this copy is
         // issued to.
-        let (dst_ptr, record_dst) =
+        let (dst_ptr, _record_dst) =
             cudarc::driver::DevicePtrMut::device_ptr_mut(&mut dst, &self.stream);
-        let copy_result =
-            unsafe { cudarc::driver::result::memcpy_htod_async(dst_ptr, src, self.stream.cu_stream()) };
-        // `record_dst` (a `SyncOnDrop` borrowing `dst`) must run its Drop --
-        // event tracking is globally off in this fork, so this is a no-op,
-        // but its BORROW of `dst` must still end before `dst` can be moved
-        // out below.
-        drop(record_dst);
-        copy_result.w()?;
+        unsafe { cudarc::driver::result::memcpy_htod_async(dst_ptr, src, self.stream.cu_stream()) }.w()?;
         Ok(dst)
     }
 
