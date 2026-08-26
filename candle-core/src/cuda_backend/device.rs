@@ -104,20 +104,7 @@ pub struct CudaDevice {
     pub(crate) cublas_one_zero: Arc<CublasOneZero>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
-    /// A persistent, page-locked (pinned) host scratch buffer this device's
-    /// [`CudaDevice::upload_shape_descriptor`] reuses for every small
-    /// dims/strides array the CUDA backend's indexing/gather/scatter/
-    /// elementwise kernels upload before every launch -- see that method's
-    /// own doc comment for why this exists.
-    shape_descriptor_pinned: Arc<Mutex<cudarc::driver::PinnedHostSlice<usize>>>,
 }
-
-/// Capacity (in `usize` elements) of [`CudaDevice::shape_descriptor_pinned`]
-/// -- generous headroom over the largest `[dims..., strides...]` array any
-/// op in this backend builds (typically under 8 elements for the highest-
-/// rank tensors this workspace uses; nothing here approaches even a
-/// quarter of this).
-const SHAPE_DESCRIPTOR_SCRATCH_CAPACITY: usize = 64;
 
 impl std::fmt::Debug for CudaDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -379,22 +366,6 @@ impl CudaDevice {
         unsafe {
             context.disable_event_tracking();
         }
-        // rainfall-one fork (2026-08-26): a persistent pinned host buffer
-        // for CudaDevice::upload_shape_descriptor -- see that method's own
-        // doc comment for the capture-illegal pattern it exists to replace
-        // (dev.clone_htod() from plain, PAGEABLE host Vecs, present at 15+
-        // call sites across this crate's own CUDA op-dispatch machinery,
-        // confirmed live 2026-08-26 as the cause of
-        // CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED on the very first captured
-        // op -- Tensor::index_select). Allocated once here, well before any
-        // capture attempt; `alloc_pinned` is a context-level resource
-        // allocation (page-locked host memory), never legal to call DURING
-        // capture, which is exactly why this buffer is built once at
-        // device construction and reused for the device's entire lifetime
-        // rather than allocated fresh per call.
-        let shape_descriptor_pinned = Arc::new(Mutex::new(
-            unsafe { context.alloc_pinned::<usize>(SHAPE_DESCRIPTOR_SCRATCH_CAPACITY) }.w()?,
-        ));
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         // rainfall-one fork: device-pointer coefficients for CUDA-graph-
         // capturable matmul -- see CublasOneZero's own doc comment.
@@ -425,96 +396,7 @@ impl CudaDevice {
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
-            shape_descriptor_pinned,
         })
-    }
-
-    /// Upload a small `dims`/`strides`-style descriptor array to the
-    /// device, returning a freshly-allocated `CudaSlice<usize>` -- the
-    /// Compute Unified Device Architecture (CUDA) graph capture-safe
-    /// replacement for `self.stream.clone_htod(values)`, which every
-    /// indexing/gather/scatter/broadcast kernel dispatch in this crate's
-    /// CUDA backend (`cuda_backend/mod.rs`, 15+ call sites as of this
-    /// writing) calls once per launch to upload that launch's own
-    /// `[dims..., strides...]` array.
-    ///
-    /// `clone_htod` allocates its destination via the stream-ordered pool
-    /// allocator (itself capture-safe -- confirmed by reading this
-    /// backend's own device-allocation code, which already routes through
-    /// `cuMemAllocAsync` whenever async allocation is enabled, the default
-    /// here), so the allocation was never the problem. The COPY is:
-    /// `cuMemcpyHtoDAsync` from ordinary Rust heap memory (a `Vec` built
-    /// fresh on the host every call) is only genuinely asynchronous when
-    /// its HOST-side source is page-locked; from plain (pageable) memory
-    /// the driver falls back to a synchronous copy, and any synchronous
-    /// operation issued to a stream mid-capture returns
-    /// `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` -- confirmed live
-    /// 2026-08-26 as the exact failure on the first captured op
-    /// (`Tensor::index_select`'s `IndexSelect::f`).
-    ///
-    /// This method stages `values` through [`CudaDevice`]'s persistent
-    /// `shape_descriptor_pinned` buffer (page-locked, allocated once at
-    /// device construction, long before any capture) instead: a plain
-    /// host-side `copy_nonoverlapping` (not a CUDA call at all, always
-    /// legal) followed by a genuinely asynchronous `cuMemcpyHtoDAsync`
-    /// from that pinned buffer to a freshly-allocated (pool-allocator,
-    /// capture-safe) device slice. Deliberately bypasses `PinnedHostSlice`'s
-    /// own `HostSlice` trait impl (`clone_htod(&pinned_slice)`) rather than
-    /// using it directly: that impl unconditionally issues a
-    /// `cuStreamWaitEvent` on the slice's own tracking event on every use,
-    /// which -- for a REUSED buffer whose event was last recorded by a
-    /// prior, pre-capture call -- is itself a dependency on uncaptured
-    /// work, the same `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` class this
-    /// fork's `disable_event_tracking` call already eliminated for
-    /// ordinary tensors. The raw driver call used here carries no such
-    /// tracking.
-    ///
-    /// # Panics
-    /// If `values.len()` exceeds [`SHAPE_DESCRIPTOR_SCRATCH_CAPACITY`] --
-    /// every real call site in this crate stays well under that; a caller
-    /// exceeding it indicates a new op shape this constant needs raising
-    /// for, not a data condition to recover from.
-    pub(crate) fn upload_shape_descriptor(&self, values: &[usize]) -> Result<cudarc::driver::CudaSlice<usize>> {
-        assert!(
-            values.len() <= SHAPE_DESCRIPTOR_SCRATCH_CAPACITY,
-            "shape descriptor of {} elements exceeds the {SHAPE_DESCRIPTOR_SCRATCH_CAPACITY}-element pinned scratch buffer",
-            values.len(),
-        );
-        let mut pinned = self
-            .shape_descriptor_pinned
-            .lock()
-            .expect("shape_descriptor_pinned mutex poisoned");
-        // `PinnedHostSlice`'s own fields are private to cudarc, so its
-        // public `as_mut_ptr()` is the only way to reach the underlying
-        // pointer -- it also calls the buffer's own (never-recorded, since
-        // this method never goes through `HostSlice::stream_synced_slice`)
-        // event's `synchronize()` first, a plain host-thread block that
-        // returns immediately for an event with no pending work and does
-        // not touch the stream being captured, so it costs nothing here
-        // and is legal during capture regardless.
-        let ptr = pinned.as_mut_ptr().w()?;
-        // SAFETY: `ptr` is valid, page-locked memory for
-        // SHAPE_DESCRIPTOR_SCRATCH_CAPACITY elements (allocated in
-        // `new_with_stream`/`new` and never freed before this device is
-        // dropped); `values.len()` is asserted not to exceed that above.
-        // A plain host-to-host memory write, not a CUDA API call -- legal
-        // unconditionally, including during an active graph capture.
-        unsafe {
-            std::ptr::copy_nonoverlapping(values.as_ptr(), ptr, values.len());
-        }
-        // SAFETY: the same region just written, read back immediately
-        // afterward on this same thread -- no concurrent host mutation is
-        // possible while `pinned`'s mutex guard is held.
-        let src = unsafe { std::slice::from_raw_parts(ptr, values.len()) };
-        let mut dst = unsafe { self.stream.alloc::<usize>(values.len()) }.w()?;
-        // SAFETY: `dst` was just allocated with exactly `values.len()`
-        // elements of type `usize`, matching `src`'s length and `T`; `dst`
-        // was allocated on `self.stream`, the same stream this copy is
-        // issued to.
-        let (dst_ptr, _record_dst) =
-            cudarc::driver::DevicePtrMut::device_ptr_mut(&mut dst, &self.stream);
-        unsafe { cudarc::driver::result::memcpy_htod_async(dst_ptr, src, self.stream.cu_stream()) }.w()?;
-        Ok(dst)
     }
 
     /// Run `f` with this device's cuBLAS handle in
@@ -580,15 +462,6 @@ impl BackendDevice for CudaDevice {
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         let stream = context.default_stream();
-        // rainfall-one fork: required field, see `CudaDevice::new_with_stream`'s
-        // own extensive comment on `shape_descriptor_pinned` -- this
-        // constructor (the default per-thread-stream path, never called by
-        // Cerebra; see `rpc::device::inference_device`'s own doc comment
-        // for why) has no capture-safety requirement of its own, but the
-        // field must still be populated for every `CudaDevice` instance.
-        let shape_descriptor_pinned = Arc::new(Mutex::new(
-            unsafe { context.alloc_pinned::<usize>(SHAPE_DESCRIPTOR_SCRATCH_CAPACITY) }.w()?,
-        ));
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         // rainfall-one fork: device-pointer coefficients for CUDA-graph-
         // capturable matmul -- see CublasOneZero's own doc comment.
@@ -619,7 +492,6 @@ impl BackendDevice for CudaDevice {
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
-            shape_descriptor_pinned,
         })
     }
 
