@@ -317,6 +317,55 @@ impl CudaDevice {
     pub fn new_with_stream(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         let stream = context.new_stream().w()?;
+        // rainfall-one fork (2026-08-26): disable cudarc's cross-stream
+        // event tracking for this context's whole lifetime, immediately
+        // after the one stream this device will ever use is created.
+        //
+        // Root cause, confirmed live: a captured forward pass failed at
+        // its very first tensor read with CUDA_ERROR_STREAM_CAPTURE_ISOLATION
+        // ("dependency created on uncaptured work in another stream"),
+        // reproducing under every capture mode (THREAD_LOCAL, RELAXED).
+        // cudarc's `CudaContext::is_managing_stream_synchronization()`
+        // returns true as soon as `new_stream()` has been called even
+        // ONCE (it flags "multi-stream mode" on the CALL COUNT, not on
+        // concurrent multi-stream USE) -- and once true, EVERY
+        // `DevicePtr::device_ptr()` call unconditionally inserts a
+        // `cuStreamWaitEvent` for that slice's last-recorded write event
+        // (`cudarc::driver::safe::core::CudaSlice::device_ptr`, no
+        // same-stream skip). Every persistent tensor this device ever
+        // allocates -- model weights, KV-cache blocks, the decode-token
+        // buffer -- was written long before any capture attempt begins,
+        // so that recorded event predates `cuStreamBeginCapture` by
+        // construction. Waiting on it during capture is a dependency on
+        // pre-capture (uncaptured) work, illegal under CUDA's capture
+        // model regardless of capture mode and regardless of whether the
+        // wait targets the SAME physical stream the event was recorded
+        // on -- exactly the failure observed.
+        //
+        // Disabling event tracking is safe here specifically because
+        // `new_with_stream` is the ONLY place this crate ever calls
+        // `CudaContext::new_stream()` -- one stream is created, once, and
+        // every kernel launch/cuBLAS/cuRAND call on this device reuses
+        // that same `Arc<CudaStream>` for the rest of the process
+        // (`CudaDevice::cuda_stream()`, `CudaFunc::stream`, `self.blas`,
+        // `self.curand` are all built from this one `stream.clone()`).
+        // cudarc's own safety contract for `disable_event_tracking()`
+        // only requires the CALLER to preserve write-before-read and
+        // free-after-last-use ordering across MULTIPLE concurrently-used
+        // streams -- a condition this device never creates in the first
+        // place, so there is nothing left for event tracking to protect
+        // against; it exists purely to satisfy cudarc's "was
+        // `new_stream()` ever called" heuristic, at the cost of breaking
+        // graph capture for every tensor this device touches.
+        //
+        // # Safety
+        // No second stream is ever created against `context` anywhere in
+        // this codebase (grepped, both this crate and every downstream
+        // consumer) -- see the comment above for why that is exactly
+        // cudarc's own stated precondition for this call being sound.
+        unsafe {
+            context.disable_event_tracking();
+        }
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         // rainfall-one fork: device-pointer coefficients for CUDA-graph-
         // capturable matmul -- see CublasOneZero's own doc comment.
