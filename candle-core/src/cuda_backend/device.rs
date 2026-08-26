@@ -352,9 +352,27 @@ impl CudaDevice {
     /// propagated (mirroring this fork's `run_matmul_workspace_repro`
     /// diagnostic's own established discipline for restoring shared
     /// cuBLAS handle state) -- `f`'s result is still the return value.
-    pub fn with_cublas_device_pointer_mode<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+    /// Deliberately generic over `f`'s own error type `E`, not this
+    /// crate's own `candle_core::Error` -- a caller doing raw capture work
+    /// (like this fork's own `run_and_log`/`try_capture_and_replay`
+    /// diagnostic, which reports failures as plain `String`s) should not
+    /// need a `candle_core::Error` conversion just to use this helper.
+    /// Both `set_pointer_mode` calls are non-fatal by design (logged, not
+    /// propagated as `E`) -- there is no meaningful way to convert a
+    /// `CublasError` into an arbitrary caller-supplied `E` without a
+    /// `From` bound this method deliberately avoids requiring; a failure
+    /// entering DEVICE mode surfaces naturally anyway, as `f`'s own error
+    /// when its captured matmul dereferences a host address as if it were
+    /// a device pointer.
+    pub fn with_cublas_device_pointer_mode<R, E>(&self, f: impl FnOnce() -> std::result::Result<R, E>) -> std::result::Result<R, E> {
         use cudarc::cublas::sys::cublasPointerMode_t;
-        self.blas.set_pointer_mode(cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE).w()?;
+        if let Err(e) = self.blas.set_pointer_mode(cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE) {
+            eprintln!(
+                "CudaDevice::with_cublas_device_pointer_mode: WARNING -- failed to set \
+                 DEVICE pointer mode: {e} (the closure's own matmul will likely fail \
+                 with a host-address-as-device-pointer error instead)"
+            );
+        }
         let result = f();
         if let Err(e) = self.blas.set_pointer_mode(cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST) {
             eprintln!(
