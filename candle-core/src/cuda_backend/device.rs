@@ -26,6 +26,54 @@ impl DeviceId {
 struct CudaRng(cudarc::curand::CudaRng);
 unsafe impl Send for CudaRng {}
 
+/// Device-resident `1.0`/`0.0` constants for cuBLAS's `alpha`/`beta` GEMM
+/// coefficients, one pair per dtype this backend's matmul actually issues
+/// coefficients for (f32, f16, bf16 -- f64 matmul is not used by any
+/// consumer of this fork and is left on cuBLAS's default host pointer
+/// mode, which is incompatible with the device-pointer mode this struct
+/// exists to support).
+///
+/// # Why this exists (rainfall-one fork, not upstream candle-core)
+///
+/// Every call site in this module passes `alpha=1`, `beta=0` -- candle's
+/// matmul never uses any other coefficient. Upstream candle-core takes
+/// the ADDRESS OF A HOST-LOCAL COPY of those literals
+/// (`&cfg.gemm.alpha as *const _`) and relies on cuBLAS's default
+/// `CUBLAS_POINTER_MODE_HOST` to dereference it. Confirmed live
+/// (rainfall-rajesh, 2026-08-26, on a GPU-passthrough VM after Webyne
+/// fixed a mixed-guest-OS NVIDIA driver install): CUDA graph capture of
+/// ANY cuBLAS matmul under HOST pointer mode fails with
+/// `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`/`CUBLAS_STATUS_INTERNAL_ERROR`
+/// on this environment, ruled out as buffer-address instability,
+/// explicit-workspace allocation, capture mode (THREAD_LOCAL/RELAXED/GLOBAL),
+/// and legacy-cuBLAS-vs-cuBLASLt -- `CUBLAS_POINTER_MODE_DEVICE` with
+/// device-resident coefficients is the one change that fixes it. Since
+/// the coefficient is always the same two constants, allocating them ONCE
+/// at device construction (rather than per-call) avoids adding any
+/// per-matmul allocation to the hot decode path this fork exists to speed
+/// up in the first place.
+pub(crate) struct CublasOneZero {
+    pub(crate) f32_one: cudarc::driver::CudaSlice<f32>,
+    pub(crate) f32_zero: cudarc::driver::CudaSlice<f32>,
+    pub(crate) f16_one: cudarc::driver::CudaSlice<f16>,
+    pub(crate) f16_zero: cudarc::driver::CudaSlice<f16>,
+    pub(crate) bf16_one: cudarc::driver::CudaSlice<bf16>,
+    pub(crate) bf16_zero: cudarc::driver::CudaSlice<bf16>,
+}
+
+impl CublasOneZero {
+    fn new(stream: &Arc<cudarc::driver::CudaStream>) -> Result<Self> {
+        Ok(Self {
+            f32_one: stream.memcpy_stod(&[1f32]).w()?,
+            f32_zero: stream.memcpy_stod(&[0f32]).w()?,
+            f16_one: stream.memcpy_stod(&[f16::from_f32(1.0)]).w()?,
+            f16_zero: stream.memcpy_stod(&[f16::from_f32(0.0)]).w()?,
+            bf16_one: stream.memcpy_stod(&[bf16::from_f32(1.0)]).w()?,
+            bf16_zero: stream.memcpy_stod(&[bf16::from_f32(0.0)]).w()?,
+        })
+    }
+}
+
 pub struct ModuleStore {
     mdls: [Option<Arc<cudarc::driver::CudaModule>>; kernels::ALL_IDS.len()],
 }
@@ -38,6 +86,7 @@ pub struct CudaDevice {
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
+    pub(crate) cublas_one_zero: Arc<CublasOneZero>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
 }
@@ -254,6 +303,11 @@ impl CudaDevice {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         let stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        // rainfall-one fork: device-pointer coefficients for CUDA-graph-
+        // capturable matmul -- see CublasOneZero's own doc comment.
+        let cublas_one_zero = CublasOneZero::new(&stream)?;
+        blas.set_pointer_mode(cudarc::cublas::sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE)
+            .w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
@@ -263,6 +317,7 @@ impl CudaDevice {
             context,
             stream,
             blas: Arc::new(blas),
+            cublas_one_zero: Arc::new(cublas_one_zero),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -278,6 +333,11 @@ impl BackendDevice for CudaDevice {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         let stream = context.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        // rainfall-one fork: device-pointer coefficients for CUDA-graph-
+        // capturable matmul -- see CublasOneZero's own doc comment.
+        let cublas_one_zero = CublasOneZero::new(&stream)?;
+        blas.set_pointer_mode(cudarc::cublas::sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE)
+            .w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
@@ -287,6 +347,7 @@ impl BackendDevice for CudaDevice {
             context,
             stream,
             blas: Arc::new(blas),
+            cublas_one_zero: Arc::new(cublas_one_zero),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),

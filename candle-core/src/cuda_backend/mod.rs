@@ -2200,8 +2200,10 @@ impl BackendStorage for CudaStorage {
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
                 let cfg = gemm_config(bf16::ONE, bf16::ZERO, (b, m, n, k), lhs_l, rhs_l)?;
                 let mut out = unsafe { dev.alloc::<bf16>(elem_count)? };
-                unsafe { gemm_strided_batched_bf16(&self.device.blas, cfg, rhs, lhs, &mut out) }
-                    .w()?;
+                unsafe {
+                    gemm_strided_batched_bf16(&self.device.blas, &self.device.cublas_one_zero, cfg, rhs, lhs, &mut out)
+                }
+                .w()?;
                 CudaStorageSlice::BF16(out)
             }
             (CudaStorageSlice::F16(lhs), CudaStorageSlice::F16(rhs)) => {
@@ -2209,8 +2211,10 @@ impl BackendStorage for CudaStorage {
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
                 let cfg = gemm_config(f16::ONE, f16::ZERO, (b, m, n, k), lhs_l, rhs_l)?;
                 let mut out = unsafe { dev.alloc::<f16>(elem_count)? };
-                unsafe { gemm_strided_batched_f16(&self.device.blas, cfg, rhs, lhs, &mut out) }
-                    .w()?;
+                unsafe {
+                    gemm_strided_batched_f16(&self.device.blas, &self.device.cublas_one_zero, cfg, rhs, lhs, &mut out)
+                }
+                .w()?;
                 CudaStorageSlice::F16(out)
             }
             (CudaStorageSlice::F32(lhs), CudaStorageSlice::F32(rhs)) => {
@@ -2218,22 +2222,34 @@ impl BackendStorage for CudaStorage {
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
                 let cfg = gemm_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
                 let mut out = unsafe { dev.alloc::<f32>(elem_count)? };
-                unsafe { gemm_strided_batched_f32(&self.device.blas, cfg, rhs, lhs, &mut out) }
-                    .w()?;
-                CudaStorageSlice::F32(out)
-            }
-            (CudaStorageSlice::F64(lhs), CudaStorageSlice::F64(rhs)) => {
-                let lhs = &lhs.slice(lhs_l.start_offset()..);
-                let rhs = &rhs.slice(rhs_l.start_offset()..);
-                let cfg = gemm_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
-                let mut out = unsafe { dev.alloc::<f64>(elem_count)? };
                 unsafe {
-                    self.device
-                        .blas
-                        .gemm_strided_batched(cfg, rhs, lhs, &mut out)
+                    gemm_strided_batched_f32(&self.device.blas, &self.device.cublas_one_zero, cfg, rhs, lhs, &mut out)
                 }
                 .w()?;
-                CudaStorageSlice::F64(out)
+                CudaStorageSlice::F32(out)
+            }
+            (CudaStorageSlice::F64(_), CudaStorageSlice::F64(_)) => {
+                // rainfall-one fork: not supported. CublasOneZero (see its
+                // own doc comment) sets this device's cuBLAS handle to
+                // CUBLAS_POINTER_MODE_DEVICE globally at construction, for
+                // CUDA-graph-capturable matmul on f32/f16/bf16 -- the
+                // three dtypes this fork's device-resident alpha/beta
+                // constants cover. cudarc's own `Gemm` trait
+                // (`self.device.blas.gemm_strided_batched`, upstream's f64
+                // path) still takes `&cfg.gemm.alpha as *const f64`, a HOST
+                // address -- under DEVICE pointer mode that address gets
+                // dereferenced as if it were device memory, silently
+                // computing with garbage rather than failing at the call
+                // site. Erroring loudly here is safer than adding an
+                // unused, untested f64 device-pointer path for a dtype
+                // Cerebra (and everything else in this workspace, per a
+                // full audit 2026-08-26) never actually uses.
+                Err(CudaError::InternalError(
+                    "f64 matmul is not supported by the rainfall-one candle-core fork \
+                     (CUBLAS_POINTER_MODE_DEVICE, set globally for CUDA graph capture, \
+                     is incompatible with upstream's f64 gemm path -- see this arm's own \
+                     comment in cuda_backend/mod.rs)",
+                ))?
             }
             _ => Err(CudaError::InternalError("dtype mismatch in matmul op"))?,
         };
@@ -2515,23 +2531,31 @@ pub fn set_gemm_reduced_precision_bf16(b: bool) {
 
 unsafe fn gemm_strided_batched_f32(
     cublas: &cudarc::cublas::CudaBlas,
+    one_zero: &device::CublasOneZero,
     cfg: StridedBatchedConfig<f32>,
     a: &cudarc::driver::CudaView<f32>,
     b: &cudarc::driver::CudaView<f32>,
     c: &mut CudaSlice<f32>,
 ) -> std::result::Result<(), cudarc::cublas::result::CublasError> {
     use cudarc::cublas::sys;
-    use cudarc::driver::DevicePtrMut;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
 
     let compute_type = if gemm_reduced_precision_f32() {
         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
     } else {
         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
     };
-    let alpha = &cfg.gemm.alpha as *const f32 as *const _;
-    let beta = &cfg.gemm.beta as *const f32 as *const _;
 
     let stream = c.stream().clone();
+    // rainfall-one fork: device-resident alpha/beta (CUBLAS_POINTER_MODE_DEVICE,
+    // set once at CudaDevice construction) instead of upstream's
+    // `&cfg.gemm.alpha as *const _` host address -- see CublasOneZero's
+    // own doc comment for why. cfg.gemm.alpha/beta themselves are unused:
+    // every call site in this module passes exactly 1.0/0.0.
+    let (alpha, _guard_alpha) = one_zero.f32_one.device_ptr(&stream);
+    let (beta, _guard_beta) = one_zero.f32_zero.device_ptr(&stream);
+    let alpha = alpha as *const f32 as *const _;
+    let beta = beta as *const f32 as *const _;
     let (a, _guard_a) = a.device_ptr(&stream);
     let (b, _guard_b) = b.device_ptr(&stream);
     let (c, _guard_c) = c.device_ptr_mut(&stream);
@@ -2565,33 +2589,42 @@ unsafe fn gemm_strided_batched_f32(
 
 unsafe fn gemm_strided_batched_f16(
     cublas: &cudarc::cublas::CudaBlas,
+    one_zero: &device::CublasOneZero,
     cfg: StridedBatchedConfig<f16>,
     a: &cudarc::driver::CudaView<f16>,
     b: &cudarc::driver::CudaView<f16>,
     c: &mut CudaSlice<f16>,
 ) -> std::result::Result<(), cudarc::cublas::result::CublasError> {
     use cudarc::cublas::sys;
-    use cudarc::driver::DevicePtrMut;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
 
-    let alpha = cfg.gemm.alpha;
-    let beta = cfg.gemm.beta;
-    let alpha_f32: f32 = cfg.gemm.alpha.to_f32();
-    let beta_f32: f32 = cfg.gemm.beta.to_f32();
-    let (compute_type, alpha, beta) = if gemm_reduced_precision_f16() {
+    let stream = c.stream().clone();
+    // rainfall-one fork: device-resident alpha/beta -- see
+    // gemm_strided_batched_f32's own comment and CublasOneZero's doc
+    // comment. cfg.gemm.alpha/beta are unused: every call site passes
+    // exactly 1.0/0.0.
+    let (compute_type, alpha, beta, _guard_alpha, _guard_beta) = if gemm_reduced_precision_f16() {
+        let (alpha, ga) = one_zero.f16_one.device_ptr(&stream);
+        let (beta, gb) = one_zero.f16_zero.device_ptr(&stream);
         (
             sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
-            (&alpha) as *const f16 as *const _,
-            (&beta) as *const f16 as *const _,
+            alpha as *const f16 as *const _,
+            beta as *const f16 as *const _,
+            ga,
+            gb,
         )
     } else {
+        let (alpha, ga) = one_zero.f32_one.device_ptr(&stream);
+        let (beta, gb) = one_zero.f32_zero.device_ptr(&stream);
         (
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            (&alpha_f32) as *const f32 as *const _,
-            (&beta_f32) as *const f32 as *const _,
+            alpha as *const f32 as *const _,
+            beta as *const f32 as *const _,
+            ga,
+            gb,
         )
     };
 
-    let stream = c.stream().clone();
     let (a, _guard_a) = a.device_ptr(&stream);
     let (b, _guard_b) = b.device_ptr(&stream);
     let (c, _guard_c) = c.device_ptr_mut(&stream);
@@ -2624,33 +2657,33 @@ unsafe fn gemm_strided_batched_f16(
 
 unsafe fn gemm_strided_batched_bf16(
     cublas: &cudarc::cublas::CudaBlas,
+    one_zero: &device::CublasOneZero,
     cfg: StridedBatchedConfig<bf16>,
     a: &cudarc::driver::CudaView<bf16>,
     b: &cudarc::driver::CudaView<bf16>,
     c: &mut CudaSlice<bf16>,
 ) -> std::result::Result<(), cudarc::cublas::result::CublasError> {
     use cudarc::cublas::sys;
-    use cudarc::driver::DevicePtrMut;
-
-    let alpha_f32: f32 = cfg.gemm.alpha.to_f32();
-    let beta_f32: f32 = cfg.gemm.beta.to_f32();
-    // The type for alpha and beta depends on the computeType.
-    // https://docs.nvidia.com/cuda/cublas/index.html#cublasgemmstridedbatchedex
-    let (compute_type, alpha, beta) = if gemm_reduced_precision_bf16() {
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
-            (&alpha_f32) as *const f32 as *const _,
-            (&beta_f32) as *const f32 as *const _,
-        )
-    } else {
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            (&alpha_f32) as *const f32 as *const _,
-            (&beta_f32) as *const f32 as *const _,
-        )
-    };
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
 
     let stream = c.stream().clone();
+    // rainfall-one fork: device-resident alpha/beta -- both branches here
+    // use f32-typed coefficients regardless of gemm_reduced_precision_bf16(),
+    // matching upstream's own alpha_f32/beta_f32 (bf16 has no native
+    // cublasComputeType alpha/beta representation distinct from f32). See
+    // gemm_strided_batched_f32's own comment and CublasOneZero's doc
+    // comment. cfg.gemm.alpha/beta are unused: every call site passes
+    // exactly 1.0/0.0.
+    let (alpha, _guard_alpha) = one_zero.f32_one.device_ptr(&stream);
+    let (beta, _guard_beta) = one_zero.f32_zero.device_ptr(&stream);
+    let alpha = alpha as *const f32 as *const _;
+    let beta = beta as *const f32 as *const _;
+    let compute_type = if gemm_reduced_precision_bf16() {
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF
+    } else {
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+    };
+
     let (a, _guard_a) = a.device_ptr(&stream);
     let (b, _guard_b) = b.device_ptr(&stream);
     let (c, _guard_c) = c.device_ptr_mut(&stream);
