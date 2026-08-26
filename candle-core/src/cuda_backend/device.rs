@@ -59,6 +59,20 @@ pub(crate) struct CublasOneZero {
     pub(crate) f16_zero: cudarc::driver::CudaSlice<f16>,
     pub(crate) bf16_one: cudarc::driver::CudaSlice<bf16>,
     pub(crate) bf16_zero: cudarc::driver::CudaSlice<bf16>,
+    /// Tracks whether the handle is CURRENTLY in
+    /// `CUBLAS_POINTER_MODE_DEVICE`, set/cleared by
+    /// [`CudaDevice::with_cublas_device_pointer_mode`]. The gemm helper
+    /// functions read this (a plain relaxed atomic load, no FFI) instead
+    /// of querying cuBLAS's own handle state via `cublasGetPointerMode`
+    /// on every single matmul call. Confirmed live 2026-08-26: an earlier
+    /// version of this fix DID query `cublas.get_pointer_mode()` per call,
+    /// and eager decode stayed pinned at ~162ms/token even after scoping
+    /// DEVICE mode to only the capture window -- eager calls never enter
+    /// that window at all, so the per-call FFI round-trip itself (not
+    /// pointer mode) was the real regression, happening on every one of
+    /// the many matmul calls per decode step (QKV/output projections,
+    /// MoE FFN gate/up/down) regardless of which mode was ever active.
+    pub(crate) device_pointer_mode_active: std::sync::atomic::AtomicBool,
 }
 
 impl CublasOneZero {
@@ -70,6 +84,7 @@ impl CublasOneZero {
             f16_zero: stream.memcpy_stod(&[f16::from_f32(0.0)]).w()?,
             bf16_one: stream.memcpy_stod(&[bf16::from_f32(1.0)]).w()?,
             bf16_zero: stream.memcpy_stod(&[bf16::from_f32(0.0)]).w()?,
+            device_pointer_mode_active: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -366,6 +381,7 @@ impl CudaDevice {
     /// a device pointer.
     pub fn with_cublas_device_pointer_mode<R, E>(&self, f: impl FnOnce() -> std::result::Result<R, E>) -> std::result::Result<R, E> {
         use cudarc::cublas::sys::cublasPointerMode_t;
+        use std::sync::atomic::Ordering;
         if let Err(e) = self.blas.set_pointer_mode(cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE) {
             eprintln!(
                 "CudaDevice::with_cublas_device_pointer_mode: WARNING -- failed to set \
@@ -373,7 +389,13 @@ impl CudaDevice {
                  with a host-address-as-device-pointer error instead)"
             );
         }
+        // Relaxed: this flag only needs to be visible to gemm calls issued
+        // by the SAME thread inside `f` (matching CU_STREAM_CAPTURE_MODE_
+        // THREAD_LOCAL's own same-thread assumption) -- no cross-thread
+        // synchronization requirement to uphold.
+        self.cublas_one_zero.device_pointer_mode_active.store(true, Ordering::Relaxed);
         let result = f();
+        self.cublas_one_zero.device_pointer_mode_active.store(false, Ordering::Relaxed);
         if let Err(e) = self.blas.set_pointer_mode(cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST) {
             eprintln!(
                 "CudaDevice::with_cublas_device_pointer_mode: WARNING -- pointer mode \

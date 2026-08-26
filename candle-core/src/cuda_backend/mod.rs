@@ -2560,8 +2560,8 @@ unsafe fn gemm_strided_batched_f32(
     // same values -- every call site in this module passes exactly
     // 1.0/0.0 -- this is purely about which memory space cuBLAS is told
     // to read them from.
-    let pointer_mode = cublas.get_pointer_mode().unwrap_or(sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST);
-    let (alpha, beta, _guard_alpha, _guard_beta) = if pointer_mode == sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE {
+    let use_device_ptr = one_zero.device_pointer_mode_active.load(std::sync::atomic::Ordering::Relaxed);
+    let (alpha, beta, _guard_alpha, _guard_beta) = if use_device_ptr {
         let (alpha, ga) = one_zero.f32_one.device_ptr(&stream);
         let (beta, gb) = one_zero.f32_zero.device_ptr(&stream);
         (alpha as *const f32 as *const _, beta as *const f32 as *const _, ga, gb)
@@ -2627,8 +2627,7 @@ unsafe fn gemm_strided_batched_f16(
     let beta_host = cfg.gemm.beta;
     let alpha_host_f32: f32 = cfg.gemm.alpha.to_f32();
     let beta_host_f32: f32 = cfg.gemm.beta.to_f32();
-    let pointer_mode = cublas.get_pointer_mode().unwrap_or(sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST);
-    let use_device_ptr = pointer_mode == sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE;
+    let use_device_ptr = one_zero.device_pointer_mode_active.load(std::sync::atomic::Ordering::Relaxed);
     let (compute_type, alpha, beta, _guard_alpha, _guard_beta) = if gemm_reduced_precision_f16() {
         if use_device_ptr {
             let (alpha, ga) = one_zero.f16_one.device_ptr(&stream);
@@ -2709,8 +2708,8 @@ unsafe fn gemm_strided_batched_bf16(
     // 1.0/0.0) but preserved for the HOST branch, matching upstream.
     let alpha_host_f32: f32 = cfg.gemm.alpha.to_f32();
     let beta_host_f32: f32 = cfg.gemm.beta.to_f32();
-    let pointer_mode = cublas.get_pointer_mode().unwrap_or(sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_HOST);
-    let (alpha, beta, _guard_alpha, _guard_beta) = if pointer_mode == sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE {
+    let use_device_ptr = one_zero.device_pointer_mode_active.load(std::sync::atomic::Ordering::Relaxed);
+    let (alpha, beta, _guard_alpha, _guard_beta) = if use_device_ptr {
         let (alpha, ga) = one_zero.f32_one.device_ptr(&stream);
         let (beta, gb) = one_zero.f32_zero.device_ptr(&stream);
         (alpha as *const f32 as *const _, beta as *const f32 as *const _, ga, gb)
