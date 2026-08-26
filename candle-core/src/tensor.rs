@@ -2752,6 +2752,46 @@ impl Tensor {
         (storage, &self.layout)
     }
 
+    /// rainfall-one fork (2026-08-26): public invocation entry point for
+    /// [`crate::InplaceOp2`] -- the trait itself, and [`crate::InplaceOp1`]/
+    /// [`crate::InplaceOp3`], are already exported at the crate root, but
+    /// this version of candle-core has NO public `Tensor` method anywhere
+    /// that actually calls `Storage::inplace_op2` (confirmed by grepping
+    /// this whole crate's `tensor.rs`) -- the trait machinery exists but
+    /// was unreachable from outside the crate. `Storage::inplace_op2`
+    /// itself already exists (`storage.rs`, `pub(crate)`) and is exactly
+    /// the right shape; this method is a thin, otherwise-unchanged
+    /// wrapper exposing it, following `storage_mut_and_layout`'s own
+    /// doc comment two methods above: "If we extend the visibility of
+    /// this function to be usable outside of this crate, we should make
+    /// it unsafe."
+    ///
+    /// Mutates `self` in place via `op`'s `cuda_fwd`/`cpu_fwd`/`metal_fwd`
+    /// (backend-dispatched by `Storage::inplace_op2`), reading `t2` as
+    /// the second (read-only) operand. `self` and `t2` are NOT required
+    /// to be the same shape/dtype -- `op`'s own implementation is
+    /// responsible for validating whatever shape relationship it needs
+    /// from the `Layout`s it receives.
+    ///
+    /// # Safety
+    /// `op`'s `cuda_fwd`/`cpu_fwd`/`metal_fwd` receives `&mut
+    /// {Cuda,Cpu,Metal}Storage` for `self` and is trusted to write only
+    /// within the bounds implied by `self`'s own `Layout`/element count.
+    /// An `op` that writes out of bounds, or that reads/writes `t2`'s
+    /// storage through any means other than the `&Layout`/`&Storage` it
+    /// is given, violates this method's safety contract. The caller is
+    /// additionally responsible for `self` not being concurrently
+    /// borrowed/read elsewhere in a way that would race with this
+    /// in-place write -- the same responsibility every OTHER in-place
+    /// mutation this crate already exposes (`slice_set`, `scatter_set`)
+    /// places on its caller, not a new category of risk this method
+    /// introduces.
+    pub unsafe fn inplace_op2(&self, t2: &Self, op: &dyn crate::InplaceOp2) -> Result<()> {
+        let (mut s1, l1) = self.storage_mut_and_layout();
+        let (s2, l2) = t2.storage_and_layout();
+        s1.inplace_op2(l1, &s2, l2, op)
+    }
+
     pub(crate) fn same_storage(&self, rhs: &Self) -> bool {
         let lhs: &RwLock<Storage> = self.storage.as_ref();
         let rhs: &RwLock<Storage> = rhs.storage.as_ref();
