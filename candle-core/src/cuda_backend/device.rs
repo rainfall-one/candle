@@ -160,6 +160,9 @@ impl CaptureArena {
         let bytes = len * std::mem::size_of::<T>();
         let aligned = arena_align(bytes);
         let offset = self.cursor.fetch_add(aligned, std::sync::atomic::Ordering::SeqCst);
+        if std::env::var("CEREBRA_ARENA_DEBUG").is_ok() {
+            eprintln!("ARENA_DEBUG real_capture bump_alloc bytes={bytes} aligned={aligned} offset={offset}");
+        }
         if offset + bytes > self.total_bytes {
             crate::bail!(
                 "CaptureArena exhausted: requested offset {offset} + {bytes} bytes exceeds \
@@ -930,6 +933,9 @@ impl CudaDevice {
         }
 
         let sizes = std::mem::take(&mut *self.measured_sizes.lock().unwrap());
+        if std::env::var("CEREBRA_ARENA_DEBUG").is_ok() {
+            eprintln!("ARENA_DEBUG dry_run sizes ({}): {:?}", sizes.len(), sizes);
+        }
         let total_bytes: usize = sizes.iter().map(|&b| arena_align(b)).sum();
         // SAFETY: the arena's own backing bytes are immediately handed to
         // `CaptureArena`, which never exposes them as `T`-typed data
