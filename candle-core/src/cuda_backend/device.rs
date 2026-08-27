@@ -93,6 +93,125 @@ pub struct ModuleStore {
     mdls: [Option<Arc<cudarc::driver::CudaModule>>; kernels::ALL_IDS.len()],
 }
 
+/// Fixed-size bump-allocation arena backing every device allocation made
+/// during a CUDA-graph capture pass -- see [`CudaDevice::alloc_mode`]'s own
+/// doc comment for why this exists (candle's per-op fresh-allocation model
+/// is otherwise incompatible with capture on this project's target
+/// hardware, both for the sync allocator, illegal mid-capture per CUDA's
+/// own rules, and separately for cudarc's async pool allocator, confirmed
+/// broken even in eager mode here).
+///
+/// Built from a dry-run pass's recorded sizes ([`CudaDevice::measured_sizes`])
+/// -- one real allocation (`backing`, owned normally, freed normally when
+/// this struct drops), then every per-op "allocation" during the actual
+/// capture pass becomes a non-owning [`cudarc::driver::CudaStream::upgrade_arena_offset`]
+/// view into it instead of a real `cuMemAlloc`/`cuMemAllocAsync` call.
+struct CaptureArena {
+    /// Owns the one real allocation this arena bump-allocates into. Never
+    /// read directly after construction (its raw pointer is cached in
+    /// `base_ptr` once, up front) -- kept alive here purely so its `Drop`
+    /// frees the backing memory when this arena itself is dropped.
+    _backing: cudarc::driver::CudaSlice<u8>,
+    base_ptr: cudarc::driver::sys::CUdeviceptr,
+    total_bytes: usize,
+    cursor: std::sync::atomic::AtomicUsize,
+}
+
+/// Rounds `bytes` up to the next multiple of 256 -- CUDA's own typical
+/// device-memory alignment granularity, generous enough for every dtype
+/// this backend allocates (up to `f64`, 8-byte aligned) with headroom for
+/// any op that benefits from wider alignment (e.g. vectorized loads).
+fn arena_align(bytes: usize) -> usize {
+    (bytes + 255) & !255
+}
+
+impl CaptureArena {
+    /// Bump-allocate `len` elements of `T` (`bytes = len *
+    /// size_of::<T>()`) from this arena. Callers (`CudaDevice::alloc`/
+    /// `alloc_zeros`) are responsible for requesting sizes in the SAME
+    /// order every capture pass -- see `alloc_mode`'s doc for why that
+    /// invariant holds (decode at `seq_len == 1` has a fully static op
+    /// sequence).
+    ///
+    /// # Errors
+    /// If the arena is exhausted (the live pass requested more total
+    /// bytes than the dry run that sized it did) -- this should never
+    /// happen if the dry run and the real capture pass ran the exact same
+    /// code path, and indicates that invariant was violated somewhere.
+    fn bump_alloc<T: cudarc::driver::DeviceRepr>(
+        &self,
+        stream: &Arc<cudarc::driver::CudaStream>,
+        len: usize,
+    ) -> Result<cudarc::driver::CudaSlice<T>> {
+        let bytes = len * std::mem::size_of::<T>();
+        let aligned = arena_align(bytes);
+        let offset = self.cursor.fetch_add(aligned, std::sync::atomic::Ordering::SeqCst);
+        if offset + bytes > self.total_bytes {
+            crate::bail!(
+                "CaptureArena exhausted: requested offset {offset} + {bytes} bytes exceeds \
+                 arena size {} bytes -- the live capture pass allocated more than the dry run \
+                 that sized this arena did, meaning the decode step's allocation sequence is \
+                 NOT static as assumed (see CudaDevice::alloc_mode's doc comment)",
+                self.total_bytes
+            );
+        }
+        Ok(unsafe { stream.upgrade_arena_offset::<T>(self.base_ptr, offset, len) })
+    }
+}
+
+/// What [`CudaDevice::alloc`]/[`CudaDevice::alloc_zeros`] do on this call --
+/// checked with one relaxed atomic load per call, so the default (`Normal`)
+/// hot path this project has spent this whole session optimizing pays
+/// negligible extra cost.
+///
+/// # Why this exists (rainfall-one fork, not upstream candle-core)
+///
+/// nsys profiling (2026-08-27) showed Cerebra's decode step is
+/// launch-bound, not compute-bound: real GPU kernel execution across a
+/// full decode request measured ~23ms/token, while the SAME window's
+/// host-side kernel-launch dispatch overhead (`cuLaunchKernel` +
+/// `cudaLaunchKernel` + `cudaLaunchKernelExC`) measured almost exactly as
+/// much (~3,500+ launches per token). CUDA graph capture is the standard
+/// fix (replays one pre-recorded launch sequence instead of dispatching
+/// thousands of individual kernels) -- both vLLM (PyTorch's graph-safe
+/// pooling allocator) and llama.cpp (ggml's static pre-planned compute
+/// arena) use it for exactly this reason, and neither can do so with a
+/// framework that allocates a fresh output tensor per op the way candle's
+/// CUDA backend does by default (`alloc`/`alloc_zeros`/`alloc_uninit`/
+/// `zeros_impl` all funnel through this same choke point) -- illegal
+/// mid-capture for the sync allocator, and separately confirmed broken
+/// even in EAGER mode on this project's specific GPU-passthrough hardware
+/// for cudarc's async pool allocator (see `CUBLAS_POINTER_MODE_DEVICE`'s
+/// own doc comment above for the sibling ~3.4x-regression finding that
+/// established this "permanently-on breaks eager" pattern).
+///
+/// `Measuring` and `Arena` are both scoped, temporary states (entered via
+/// [`CudaDevice::with_capture_arena`], never left active outside that
+/// closure) -- mirroring [`CudaDevice::with_cublas_device_pointer_mode`]'s
+/// own established "toggle on only for the capture window, always restore
+/// afterward" discipline for exactly the same reason: leaving either mode
+/// on permanently would break every OTHER (non-decode-step) allocation on
+/// this device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum AllocMode {
+    /// Default. Every allocation goes through the real
+    /// `cudarc::driver::CudaStream::alloc`/`alloc_zeros` exactly as
+    /// upstream candle-core does -- zero behavior change from stock.
+    Normal = 0,
+    /// A dry-run pass: allocations still go through the REAL allocator
+    /// (so the dry run itself produces a correct, usable result -- it is
+    /// a genuine forward pass, not a no-op), but every requested size is
+    /// ALSO appended to `CudaDevice::measured_sizes`, in call order, to
+    /// size the arena the next `Arena`-mode pass will bump-allocate into.
+    Measuring = 1,
+    /// The actual capture pass: allocations bump-allocate into
+    /// `CudaDevice::capture_arena` instead of calling the real allocator
+    /// at all (illegal mid-capture for the sync path; this is what makes
+    /// capture legal in the first place).
+    Arena = 2,
+}
+
 #[derive(Clone)]
 pub struct CudaDevice {
     id: DeviceId,
@@ -104,6 +223,21 @@ pub struct CudaDevice {
     pub(crate) cublas_one_zero: Arc<CublasOneZero>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
+    /// See [`AllocMode`]'s own doc comment. Checked with a relaxed atomic
+    /// load on every `alloc`/`alloc_zeros` call.
+    alloc_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// Populated only while `alloc_mode` is `Measuring`; drained and
+    /// cleared by [`CudaDevice::with_capture_arena`] once the dry run
+    /// completes, to build the arena those sizes describe.
+    measured_sizes: Arc<Mutex<Vec<usize>>>,
+    /// Populated only while `alloc_mode` is `Arena`; `None` at every other
+    /// time, including immediately after `with_capture_arena` returns --
+    /// the arena is a per-call, throwaway allocation, not something this
+    /// device retains between separate capture attempts (a fresh dry run
+    /// re-measures and rebuilds it every time, since the decode step's
+    /// exact byte sizes depend on which model/shapes this device is
+    /// currently serving).
+    capture_arena: Arc<Mutex<Option<CaptureArena>>>,
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -113,11 +247,38 @@ impl std::fmt::Debug for CudaDevice {
 }
 
 impl CudaDevice {
+    /// Records `bytes` in `self.measured_sizes` iff `alloc_mode` is
+    /// currently `Measuring` -- shared by `alloc`/`alloc_zeros` so both
+    /// choke points feed the same size trace in call order.
+    fn record_if_measuring(&self, bytes: usize) {
+        if self.alloc_mode.load(std::sync::atomic::Ordering::Relaxed) == AllocMode::Measuring as u8 {
+            self.measured_sizes.lock().unwrap().push(bytes);
+        }
+    }
+
+    /// Bump-allocates from `self.capture_arena` iff `alloc_mode` is
+    /// currently `Arena`, else `None` (caller falls through to the real
+    /// allocator).
+    fn try_arena_alloc<T: cudarc::driver::DeviceRepr>(&self, len: usize) -> Option<Result<cudarc::driver::CudaSlice<T>>> {
+        if self.alloc_mode.load(std::sync::atomic::Ordering::Relaxed) != AllocMode::Arena as u8 {
+            return None;
+        }
+        let guard = self.capture_arena.lock().unwrap();
+        let arena = guard
+            .as_ref()
+            .expect("CudaDevice::alloc_mode is Arena but capture_arena is None -- with_capture_arena's own invariant was violated");
+        Some(arena.bump_alloc::<T>(&self.stream, len))
+    }
+
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn alloc<T: cudarc::driver::DeviceRepr>(
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
+        if let Some(result) = self.try_arena_alloc::<T>(len) {
+            return result;
+        }
+        self.record_if_measuring(len * std::mem::size_of::<T>());
         self.stream.alloc::<T>(len).w()
     }
 
@@ -125,6 +286,12 @@ impl CudaDevice {
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
+        if let Some(result) = self.try_arena_alloc::<T>(len) {
+            let mut slice = result?;
+            self.stream.memset_zeros(&mut slice).w()?;
+            return Ok(slice);
+        }
+        self.record_if_measuring(len * std::mem::size_of::<T>());
         self.stream.alloc_zeros::<T>(len).w()
     }
 
@@ -396,6 +563,9 @@ impl CudaDevice {
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
+            alloc_mode: Arc::new(std::sync::atomic::AtomicU8::new(AllocMode::Normal as u8)),
+            measured_sizes: Arc::new(Mutex::new(Vec::new())),
+            capture_arena: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -454,6 +624,89 @@ impl CudaDevice {
         }
         result
     }
+
+    /// Runs `dry_run` once in `AllocMode::Measuring` (real allocations,
+    /// but every requested size is also recorded in call order), builds a
+    /// [`CaptureArena`] sized to exactly what that pass requested, then
+    /// runs `capture` once in `AllocMode::Arena` (allocations bump-
+    /// allocate into the arena instead of calling the real allocator at
+    /// all -- the change that makes CUDA graph capture legal on this
+    /// device: no `cuMemAlloc`/`cuMemAllocAsync` call happens during
+    /// `capture`, only kernel launches and bump-pointer arithmetic).
+    ///
+    /// `dry_run` and `capture` **must** run the exact same code path --
+    /// same op sequence, same tensor shapes -- or the arena will be
+    /// undersized (`CaptureArena::bump_alloc` returns a typed error if
+    /// so, rather than corrupting memory: it never reuses/overwrites a
+    /// byte range already handed out this pass). In practice both
+    /// closures are typically the SAME call (e.g. `|| model.forward(...)`
+    /// for the same static decode-step shape) invoked twice; kept as two
+    /// separate closures rather than one `FnMut` called twice so a caller
+    /// can discard the dry run's own output while keeping the capture
+    /// pass's, without needing the result to be meaningfully reusable
+    /// across both calls.
+    ///
+    /// Always restores `alloc_mode` to `Normal` and clears `capture_arena`
+    /// back to `None` before returning -- mirroring
+    /// [`Self::with_cublas_device_pointer_mode`]'s own "never leave a
+    /// capture-only mode active outside its own closure" discipline, for
+    /// the same reason: every OTHER allocation on this device (a
+    /// concurrent eager request, a later unrelated capture attempt)
+    /// depends on this device defaulting back to real allocation.
+    ///
+    /// # Errors
+    /// The outer [`Result`] is this crate's own error type, for failures
+    /// in the arena-scoping machinery itself (currently only the arena's
+    /// one real backing allocation, if the dry run's total measured size
+    /// exceeds available device memory). The inner
+    /// `std::result::Result<R, E>` is `dry_run`'s or `capture`'s own
+    /// result, unwrapped by the caller exactly as if they had called
+    /// either closure directly -- if `dry_run` returns `Err`, `capture`
+    /// never runs (there is nothing to size the arena from) and that
+    /// `Err` is returned immediately as `Ok(Err(..))`.
+    pub fn with_capture_arena<R, E>(
+        &self,
+        dry_run: impl FnOnce() -> std::result::Result<R, E>,
+        capture: impl FnOnce() -> std::result::Result<R, E>,
+    ) -> Result<std::result::Result<R, E>> {
+        use std::sync::atomic::Ordering;
+
+        self.measured_sizes.lock().unwrap().clear();
+        self.alloc_mode.store(AllocMode::Measuring as u8, Ordering::Relaxed);
+        let dry_run_result = dry_run();
+        self.alloc_mode.store(AllocMode::Normal as u8, Ordering::Relaxed);
+        if dry_run_result.is_err() {
+            return Ok(dry_run_result);
+        }
+
+        let sizes = std::mem::take(&mut *self.measured_sizes.lock().unwrap());
+        let total_bytes: usize = sizes.iter().map(|&b| arena_align(b)).sum();
+        // SAFETY: the arena's own backing bytes are immediately handed to
+        // `CaptureArena`, which never exposes them as `T`-typed data
+        // until a `bump_alloc` view is constructed over a sub-range a
+        // caller is about to write into -- matching every other
+        // `alloc`/`alloc_uninit` caller's own established contract in
+        // this file (uninitialized until written).
+        let backing = unsafe { self.stream.alloc::<u8>(total_bytes.max(1)) }.w()?;
+        let base_ptr = {
+            use cudarc::driver::DevicePtr;
+            backing.device_ptr(&self.stream).0
+        };
+        *self.capture_arena.lock().unwrap() = Some(CaptureArena {
+            _backing: backing,
+            base_ptr,
+            total_bytes,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+        });
+        self.alloc_mode.store(AllocMode::Arena as u8, Ordering::Relaxed);
+
+        let capture_result = capture();
+
+        self.alloc_mode.store(AllocMode::Normal as u8, Ordering::Relaxed);
+        *self.capture_arena.lock().unwrap() = None;
+
+        Ok(capture_result)
+    }
 }
 
 impl BackendDevice for CudaDevice {
@@ -492,6 +745,9 @@ impl BackendDevice for CudaDevice {
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
+            alloc_mode: Arc::new(std::sync::atomic::AtomicU8::new(AllocMode::Normal as u8)),
+            measured_sizes: Arc::new(Mutex::new(Vec::new())),
+            capture_arena: Arc::new(Mutex::new(None)),
         })
     }
 
