@@ -429,6 +429,41 @@ impl CudaDevice {
     ) -> Result<cudarc::driver::CudaSlice<T>> {
         self.stream.clone_htod(src).w()
     }
+
+    /// Upload `data` to the device -- identical to [`Self::clone_htod`]
+    /// when no capture is active (the overwhelmingly common case: every
+    /// normal eager call, and even the dry-run half of
+    /// [`Self::with_capture_arena`], which never has an active capture).
+    /// Only during the real capture pass ([`Self::is_capturing`] true)
+    /// does this take a different, capture-safe path: `clone_htod` from
+    /// ordinary `Vec`-backed host memory is illegal mid-capture (the
+    /// driver silently makes that copy SYNCHRONOUS on pageable memory --
+    /// confirmed live 2026-08-27, `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`
+    /// from `index_select`'s own small shape/stride metadata upload,
+    /// present at every one of this file's own small-metadata uploads:
+    /// `SlicePtrOrNull::params_from_layout`, `IndexSelect`, `Gather`,
+    /// `Scatter`/`ScatterAdd`, the ternary `WhereCond` op, and the
+    /// strided binary-op dispatch). Uses a freshly-allocated
+    /// [`cudarc::driver::PinnedHostSlice`] instead, whose `clone_htod` is
+    /// genuinely asynchronous (a stream-wait, not a CPU-blocking sync).
+    ///
+    /// # Errors
+    /// Propagates any `candle_core` error from the pinned allocation, the
+    /// write into it, or the device copy itself.
+    pub fn clone_htod_capture_safe<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy>(
+        &self,
+        data: &[T],
+    ) -> Result<cudarc::driver::CudaSlice<T>> {
+        if !self.is_capturing() {
+            return self.clone_htod(data);
+        }
+        // SAFETY: the freshly-allocated pinned slice is written in full
+        // (every element) immediately below, before any device operation
+        // ever reads it.
+        let mut pinned = unsafe { self.alloc_pinned::<T>(data.len()) }?;
+        pinned.as_mut_slice().map_err(crate::Error::wrap)?.copy_from_slice(data);
+        self.clone_htod(&pinned)
+    }
 }
 
 pub struct CudaFunc {
@@ -469,6 +504,43 @@ impl CudaFunc {
 impl CudaDevice {
     pub fn cuda_stream(&self) -> Arc<cudarc::driver::CudaStream> {
         self.stream.clone()
+    }
+
+    /// `true` iff this device's stream currently has an active CUDA graph
+    /// capture in progress (`CU_STREAM_CAPTURE_STATUS_ACTIVE`). Any
+    /// operation that internally does a `clone_htod`/`memcpy_htod` from
+    /// ordinary (pageable) host memory must check this before doing so --
+    /// the driver silently makes that copy SYNCHRONOUS on pageable
+    /// memory, illegal mid-capture (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`,
+    /// confirmed live 2026-08-27 via `index_select`'s own small
+    /// shape/stride metadata upload) -- see [`Self::alloc_pinned`] for
+    /// the capture-safe alternative. Returns `false` (not an error) if
+    /// the capture-status query itself fails, matching this file's
+    /// existing convention of treating stream-state queries as
+    /// best-effort diagnostics, not fatal.
+    pub fn is_capturing(&self) -> bool {
+        matches!(
+            self.stream.capture_status(),
+            Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE)
+        )
+    }
+
+    /// Allocates page-locked (pinned) host memory -- see
+    /// [`cudarc::driver::PinnedHostSlice`]'s own doc comment. Unlike
+    /// ordinary `Vec`-backed host memory, a `clone_htod`/`memcpy_htod`
+    /// from a `PinnedHostSlice` is genuinely asynchronous (stream-waits
+    /// on an event rather than blocking the CPU), making it safe to call
+    /// mid-capture -- see [`Self::is_capturing`]'s own doc comment for
+    /// why that distinction matters.
+    ///
+    /// # Safety
+    /// The returned memory is uninitialized -- the caller must write it
+    /// before any device operation reads it.
+    pub unsafe fn alloc_pinned<T: cudarc::driver::DeviceRepr>(
+        &self,
+        len: usize,
+    ) -> Result<cudarc::driver::PinnedHostSlice<T>> {
+        self.context.alloc_pinned::<T>(len).w()
     }
 
     /// When turned on, all cuda tensors **created after calling this function** will
