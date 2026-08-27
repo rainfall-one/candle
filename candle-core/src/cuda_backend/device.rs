@@ -1165,3 +1165,20 @@ impl BackendDevice for CudaDevice {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod arena_tests {
+    use super::arena_align;
+
+    /// [Unit] Rounds up to the next 256-byte boundary; an already-aligned
+    /// size is left unchanged.
+    #[test]
+    fn unit_arena_align_rounds_up_to_256() {
+        assert_eq!(arena_align(0), 0);
+        assert_eq!(arena_align(1), 256);
+        assert_eq!(arena_align(255), 256);
+        assert_eq!(arena_align(256), 256);
+        assert_eq!(arena_align(257), 512);
+        assert_eq!(arena_align(4096), 4096);
+    }
+}
