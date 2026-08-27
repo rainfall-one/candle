@@ -125,6 +125,20 @@ fn arena_align(bytes: usize) -> usize {
     (bytes + 255) & !255
 }
 
+/// Clears `CudaDevice::capturing_thread` back to `None` when dropped --
+/// guarantees this happens on EVERY exit from
+/// [`CudaDevice::with_capture_arena`] (an early return on `dry_run`
+/// failure, normal completion, or an unwinding panic from either
+/// closure), not just the happy path a hand-written reset at each return
+/// site could easily miss one of.
+struct CapturingThreadGuard<'a>(&'a Mutex<Option<std::thread::ThreadId>>);
+
+impl Drop for CapturingThreadGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
+}
+
 impl CaptureArena {
     /// Bump-allocate `len` elements of `T` (`bytes = len *
     /// size_of::<T>()`) from this arena. Callers (`CudaDevice::alloc`/
@@ -238,6 +252,50 @@ pub struct CudaDevice {
     /// exact byte sizes depend on which model/shapes this device is
     /// currently serving).
     capture_arena: Arc<Mutex<Option<CaptureArena>>>,
+    /// Guards against a real concurrent allocation racing a capture
+    /// window. `alloc_mode` alone is not enough to make `Measuring`/
+    /// `Arena` mode safe under concurrency: it is a single device-wide
+    /// flag, so ANY thread calling `alloc`/`alloc_zeros` on this device
+    /// while another thread's `with_capture_arena` is active would
+    /// observe the SAME `Measuring`/`Arena` state and be wrongly routed
+    /// through it too (measured into the wrong dry run, or bump-allocated
+    /// into an arena sized for someone else's decode step) -- caught on
+    /// self-review 2026-08-27, before this ever reached production
+    /// traffic.
+    ///
+    /// `alloc`/`alloc_zeros` hold a cheap SHARED (read) guard for the
+    /// duration of one call; [`Self::with_capture_arena`] holds an
+    /// EXCLUSIVE (write) guard for its ENTIRE duration (both the dry run
+    /// and the real capture pass). A real concurrent allocation therefore
+    /// either completes fully before a capture window can start (holding
+    /// its read guard blocks the write guard from being acquired), or
+    /// blocks until the capture window finishes (the write guard blocks
+    /// all new read guards) -- it can never observe `Measuring`/`Arena`
+    /// mode without ALSO being the capture window's own two closures.
+    /// `RwLock` over a plain `Mutex` specifically because `alloc`/
+    /// `alloc_zeros` are this device's hottest path (this project's own
+    /// nsys profiling found ~3,500+ calls per decode token) -- an
+    /// uncontended `RwLock` read acquisition costs about the same as the
+    /// `alloc_mode` atomic load it sits beside, not meaningfully more.
+    capture_gate: Arc<RwLock<()>>,
+    /// The thread currently executing inside [`Self::with_capture_arena`]
+    /// (its `dry_run`/`capture` closures), if any -- `None` at every
+    /// other time. `std::sync::RwLock` is not reentrant: a thread already
+    /// holding `capture_gate`'s write lock must NOT also try to acquire
+    /// its read lock (undefined behavior per the standard library's own
+    /// documentation, deadlocks in practice), which is exactly what
+    /// `alloc`/`alloc_zeros` would otherwise do when called (as they
+    /// always are) from INSIDE `dry_run`/`capture` -- caught on
+    /// self-review immediately after `capture_gate` was added, before
+    /// this ever reached CI. `alloc`/`alloc_zeros` check this field ONLY
+    /// on the already-rare `alloc_mode != Normal` path (the common
+    /// `Normal`-mode hot path never touches this lock at all) to tell
+    /// "this call is the SAME thread that owns the current capture
+    /// window, no gate needed" apart from "this is a genuinely
+    /// independent concurrent caller that happens to observe a capture in
+    /// progress, which DOES need to block on `capture_gate` like any
+    /// other Normal-mode caller."
+    capturing_thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -247,27 +305,32 @@ impl std::fmt::Debug for CudaDevice {
 }
 
 impl CudaDevice {
-    /// Records `bytes` in `self.measured_sizes` iff `alloc_mode` is
-    /// currently `Measuring` -- shared by `alloc`/`alloc_zeros` so both
-    /// choke points feed the same size trace in call order.
-    fn record_if_measuring(&self, bytes: usize) {
-        if self.alloc_mode.load(std::sync::atomic::Ordering::Relaxed) == AllocMode::Measuring as u8 {
-            self.measured_sizes.lock().unwrap().push(bytes);
-        }
+    /// `true` iff the calling thread is the one currently executing
+    /// inside [`Self::with_capture_arena`] -- see `capturing_thread`'s own
+    /// doc comment for why this matters (distinguishing "I am the
+    /// capture window's own dry-run/capture closure" from "I am some
+    /// other, genuinely concurrent caller that merely observes
+    /// `alloc_mode != Normal`").
+    fn is_current_thread_capturing(&self) -> bool {
+        *self.capturing_thread.lock().unwrap() == Some(std::thread::current().id())
     }
 
-    /// Bump-allocates from `self.capture_arena` iff `alloc_mode` is
-    /// currently `Arena`, else `None` (caller falls through to the real
-    /// allocator).
-    fn try_arena_alloc<T: cudarc::driver::DeviceRepr>(&self, len: usize) -> Option<Result<cudarc::driver::CudaSlice<T>>> {
-        if self.alloc_mode.load(std::sync::atomic::Ordering::Relaxed) != AllocMode::Arena as u8 {
-            return None;
-        }
+    /// Records `bytes` in `self.measured_sizes` -- called only from
+    /// `alloc`/`alloc_zeros`'s already-verified-`Measuring`-mode,
+    /// already-verified-same-thread path.
+    fn record_measured(&self, bytes: usize) {
+        self.measured_sizes.lock().unwrap().push(bytes);
+    }
+
+    /// Bump-allocates from `self.capture_arena` -- called only from
+    /// `alloc`/`alloc_zeros`'s already-verified-`Arena`-mode,
+    /// already-verified-same-thread path.
+    fn arena_alloc<T: cudarc::driver::DeviceRepr>(&self, len: usize) -> Result<cudarc::driver::CudaSlice<T>> {
         let guard = self.capture_arena.lock().unwrap();
         let arena = guard
             .as_ref()
             .expect("CudaDevice::alloc_mode is Arena but capture_arena is None -- with_capture_arena's own invariant was violated");
-        Some(arena.bump_alloc::<T>(&self.stream, len))
+        arena.bump_alloc::<T>(&self.stream, len)
     }
 
     #[allow(clippy::missing_safety_doc)]
@@ -275,10 +338,26 @@ impl CudaDevice {
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
-        if let Some(result) = self.try_arena_alloc::<T>(len) {
-            return result;
+        let mode = self.alloc_mode.load(std::sync::atomic::Ordering::Relaxed);
+        if mode != AllocMode::Normal as u8 && self.is_current_thread_capturing() {
+            // Same thread as `with_capture_arena`'s own write-lock holder
+            // -- MUST NOT also acquire `capture_gate`'s read lock here
+            // (RwLock is not reentrant; would deadlock against the write
+            // lock this same thread already holds).
+            return if mode == AllocMode::Arena as u8 {
+                self.arena_alloc::<T>(len)
+            } else {
+                self.record_measured(len * std::mem::size_of::<T>());
+                self.stream.alloc::<T>(len).w()
+            };
         }
-        self.record_if_measuring(len * std::mem::size_of::<T>());
+        // Either genuinely Normal, or a DIFFERENT thread observing a
+        // capture window that is not its own -- block on the gate (waits
+        // out any active capture window, exactly like every other
+        // Normal-mode caller must), then allocate for real. Once this
+        // read guard is held, `alloc_mode` is guaranteed `Normal` -- no
+        // writer can be active concurrently with any held read guard.
+        let _gate = self.capture_gate.read().unwrap();
         self.stream.alloc::<T>(len).w()
     }
 
@@ -286,12 +365,18 @@ impl CudaDevice {
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
-        if let Some(result) = self.try_arena_alloc::<T>(len) {
-            let mut slice = result?;
-            self.stream.memset_zeros(&mut slice).w()?;
-            return Ok(slice);
+        let mode = self.alloc_mode.load(std::sync::atomic::Ordering::Relaxed);
+        if mode != AllocMode::Normal as u8 && self.is_current_thread_capturing() {
+            return if mode == AllocMode::Arena as u8 {
+                let mut slice = self.arena_alloc::<T>(len)?;
+                self.stream.memset_zeros(&mut slice).w()?;
+                Ok(slice)
+            } else {
+                self.record_measured(len * std::mem::size_of::<T>());
+                self.stream.alloc_zeros::<T>(len).w()
+            };
         }
-        self.record_if_measuring(len * std::mem::size_of::<T>());
+        let _gate = self.capture_gate.read().unwrap();
         self.stream.alloc_zeros::<T>(len).w()
     }
 
@@ -566,6 +651,8 @@ impl CudaDevice {
             alloc_mode: Arc::new(std::sync::atomic::AtomicU8::new(AllocMode::Normal as u8)),
             measured_sizes: Arc::new(Mutex::new(Vec::new())),
             capture_arena: Arc::new(Mutex::new(None)),
+            capture_gate: Arc::new(RwLock::new(())),
+            capturing_thread: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -671,6 +758,17 @@ impl CudaDevice {
     ) -> Result<std::result::Result<R, E>> {
         use std::sync::atomic::Ordering;
 
+        // Exclusive for this call's ENTIRE duration (dry run + arena
+        // build + real capture pass) -- blocks until every in-flight
+        // `alloc`/`alloc_zeros` call elsewhere finishes (each holds a
+        // shared guard), and blocks any NEW one from starting until this
+        // function returns. See `capture_gate`'s own doc comment for why
+        // `alloc_mode` alone cannot make `Measuring`/`Arena` mode safe
+        // under concurrency without this.
+        let _gate = self.capture_gate.write().unwrap();
+        *self.capturing_thread.lock().unwrap() = Some(std::thread::current().id());
+        let _capturing_thread_guard = CapturingThreadGuard(&self.capturing_thread);
+
         self.measured_sizes.lock().unwrap().clear();
         self.alloc_mode.store(AllocMode::Measuring as u8, Ordering::Relaxed);
         let dry_run_result = dry_run();
@@ -748,6 +846,8 @@ impl BackendDevice for CudaDevice {
             alloc_mode: Arc::new(std::sync::atomic::AtomicU8::new(AllocMode::Normal as u8)),
             measured_sizes: Arc::new(Mutex::new(Vec::new())),
             capture_arena: Arc::new(Mutex::new(None)),
+            capture_gate: Arc::new(RwLock::new(())),
+            capturing_thread: Arc::new(Mutex::new(None)),
         })
     }
 
