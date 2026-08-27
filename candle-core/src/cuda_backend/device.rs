@@ -244,13 +244,18 @@ pub struct CudaDevice {
     /// cleared by [`CudaDevice::with_capture_arena`] once the dry run
     /// completes, to build the arena those sizes describe.
     measured_sizes: Arc<Mutex<Vec<usize>>>,
-    /// Populated only while `alloc_mode` is `Arena`; `None` at every other
-    /// time, including immediately after `with_capture_arena` returns --
-    /// the arena is a per-call, throwaway allocation, not something this
-    /// device retains between separate capture attempts (a fresh dry run
-    /// re-measures and rebuilds it every time, since the decode step's
-    /// exact byte sizes depend on which model/shapes this device is
-    /// currently serving).
+    /// Built fresh by every [`CudaDevice::with_capture_arena`] call, and
+    /// then DELIBERATELY LEFT ALIVE after that call returns -- the
+    /// captured graph's kernels, and any tensor the caller's `capture`
+    /// closure returned, hold pointers into this arena's backing memory,
+    /// and remain valid to replay/read only as long as it stays
+    /// allocated (confirmed live 2026-08-27: freeing it immediately on
+    /// return produced `CUDA_ERROR_ILLEGAL_ADDRESS` on the very next
+    /// graph replay or output read). A later `with_capture_arena` call
+    /// legitimately replaces it (the assignment inside that method drops
+    /// the previous one) -- at most one captured graph's arena is ever
+    /// alive at a time, but it is NOT torn down merely because the
+    /// call that built it returned.
     capture_arena: Arc<Mutex<Option<CaptureArena>>>,
     /// Guards against a real concurrent allocation racing a capture
     /// window. `alloc_mode` alone is not enough to make `Measuring`/
@@ -518,7 +523,16 @@ impl CudaDevice {
                 pinned.len(),
                 data.len()
             );
-            pinned.as_mut_slice().map_err(crate::Error::wrap)?.copy_from_slice(data);
+            // SAFETY: this exact pool entry was allocated during the dry
+            // run (AllocMode::Measuring, above) and has only ever been
+            // written by that dry run's own `clone_htod` upload -- by the
+            // time the real capture pass reaches here, that upload
+            // completed synchronously (Measuring mode is never inside an
+            // active capture, so its own `clone_htod`'s implicit ordering
+            // is real, not deferred). No device operation reads or writes
+            // this pinned buffer's memory between then and now.
+            let ptr = unsafe { pinned.as_mut_ptr_unsynchronized() };
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
             return self.clone_htod(pinned);
         }
         self.clone_htod(data)
@@ -866,13 +880,16 @@ impl CudaDevice {
     /// pass's, without needing the result to be meaningfully reusable
     /// across both calls.
     ///
-    /// Always restores `alloc_mode` to `Normal` and clears `capture_arena`
-    /// back to `None` before returning -- mirroring
-    /// [`Self::with_cublas_device_pointer_mode`]'s own "never leave a
-    /// capture-only mode active outside its own closure" discipline, for
-    /// the same reason: every OTHER allocation on this device (a
-    /// concurrent eager request, a later unrelated capture attempt)
-    /// depends on this device defaulting back to real allocation.
+    /// Always restores `alloc_mode` to `Normal` before returning --
+    /// mirroring [`Self::with_cublas_device_pointer_mode`]'s own "never
+    /// leave a capture-only mode active outside its own closure"
+    /// discipline: every OTHER allocation on this device (a concurrent
+    /// eager request, a later unrelated capture attempt) depends on this
+    /// device defaulting back to real allocation. `capture_arena` itself,
+    /// however, is deliberately LEFT populated -- see its own field doc
+    /// comment for why (the captured graph and `capture`'s own returned
+    /// tensor hold pointers into it, valid only as long as it stays
+    /// allocated).
     ///
     /// # Errors
     /// The outer [`Result`] is this crate's own error type, for failures
@@ -937,7 +954,21 @@ impl CudaDevice {
         let capture_result = capture();
 
         self.alloc_mode.store(AllocMode::Normal as u8, Ordering::Relaxed);
-        *self.capture_arena.lock().unwrap() = None;
+        // Deliberately NOT tearing down `capture_arena` here -- caught
+        // live 2026-08-27: the captured graph's kernels, and any tensor
+        // `capture` itself returned, reference pointers INTO this
+        // arena's backing memory. Freeing it as soon as this function
+        // returns (the original design) left every subsequent
+        // `graph.launch()` replay, and any attempt to read `capture`'s
+        // own returned tensor, dereferencing already-freed memory --
+        // manifested as `CUDA_ERROR_ILLEGAL_ADDRESS` on the very first
+        // post-capture read. The arena must outlive `with_capture_arena`
+        // itself, for as long as the caller keeps using the graph it
+        // captured -- calling `with_capture_arena` again later
+        // legitimately replaces it (a fresh `Some(CaptureArena {...})`
+        // assignment above drops the previous one), matching "at most
+        // one captured graph's arena alive at a time," never "torn down
+        // the instant the capturing call returns."
 
         Ok(capture_result)
     }
