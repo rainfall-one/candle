@@ -296,6 +296,16 @@ pub struct CudaDevice {
     /// progress, which DOES need to block on `capture_gate` like any
     /// other Normal-mode caller."
     capturing_thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
+    /// Pinned host buffers pre-allocated by [`Self::with_capture_arena`]'s
+    /// dry-run pass for [`Self::clone_htod_capture_safe`]'s real capture
+    /// pass to reuse -- see that method's own doc comment. Cleared at the
+    /// start of every `with_capture_arena` call.
+    pinned_scratch: Arc<Mutex<Vec<cudarc::driver::PinnedHostSlice<usize>>>>,
+    /// Read/reset by [`Self::clone_htod_capture_safe`] and
+    /// [`Self::with_capture_arena`] -- indexes into `pinned_scratch` in
+    /// the same order the dry run populated it, so the real capture
+    /// pass's Nth call reuses the dry run's Nth buffer.
+    pinned_scratch_cursor: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -430,39 +440,88 @@ impl CudaDevice {
         self.stream.clone_htod(src).w()
     }
 
-    /// Upload `data` to the device -- identical to [`Self::clone_htod`]
-    /// when no capture is active (the overwhelmingly common case: every
-    /// normal eager call, and even the dry-run half of
-    /// [`Self::with_capture_arena`], which never has an active capture).
-    /// Only during the real capture pass ([`Self::is_capturing`] true)
-    /// does this take a different, capture-safe path: `clone_htod` from
-    /// ordinary `Vec`-backed host memory is illegal mid-capture (the
-    /// driver silently makes that copy SYNCHRONOUS on pageable memory --
-    /// confirmed live 2026-08-27, `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`
-    /// from `index_select`'s own small shape/stride metadata upload,
-    /// present at every one of this file's own small-metadata uploads:
-    /// `SlicePtrOrNull::params_from_layout`, `IndexSelect`, `Gather`,
-    /// `Scatter`/`ScatterAdd`, the ternary `WhereCond` op, and the
-    /// strided binary-op dispatch). Uses a freshly-allocated
-    /// [`cudarc::driver::PinnedHostSlice`] instead, whose `clone_htod` is
-    /// genuinely asynchronous (a stream-wait, not a CPU-blocking sync).
+    /// Upload `data` (always shape/stride metadata in this file -- every
+    /// real call site passes `usize`) to the device -- identical to
+    /// [`Self::clone_htod`] outside a capture window (every normal eager
+    /// call). During [`Self::with_capture_arena`]'s two passes this takes
+    /// a different, capture-safe path, split across them:
+    ///
+    /// - **Dry run** (`AllocMode::Measuring`, not actually inside
+    ///   `cuStreamBeginCapture`/`end_capture` -- only the REAL capture
+    ///   pass is): allocates a fresh [`cudarc::driver::PinnedHostSlice`]
+    ///   sized exactly for this call, uploads from it (legal: not
+    ///   mid-capture), and CACHES it in `pinned_scratch` for the real
+    ///   capture pass below to reuse.
+    /// - **Real capture** (`AllocMode::Arena`, genuinely mid-capture):
+    ///   reuses the NEXT cached buffer from the dry run, in the same call
+    ///   order -- writes fresh data into it and uploads, allocating
+    ///   nothing new. This two-phase design exists because `clone_htod`
+    ///   from ordinary `Vec`-backed (pageable) host memory is illegal
+    ///   mid-capture (confirmed live 2026-08-27,
+    ///   `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` from `index_select`'s
+    ///   own shape/stride upload, present at every one of this file's
+    ///   small-metadata uploads: `SlicePtrOrNull::params_from_layout`,
+    ///   `IndexSelect`, `Gather`, `Scatter`/`ScatterAdd`, the ternary
+    ///   `WhereCond` op, strided binary-op dispatch) -- and a NAIVE fix
+    ///   (allocate a fresh pinned buffer unconditionally whenever
+    ///   capturing) hit the IDENTICAL error, also confirmed live: pinned
+    ///   host allocation itself (`cuMemHostAlloc`) is ALSO illegal
+    ///   mid-capture on this hardware, not just the plain pageable
+    ///   upload it was meant to replace. Pre-allocating during the
+    ///   (uncaptured) dry run and only WRITING into an already-allocated
+    ///   buffer during the real capture sidesteps both illegal calls.
     ///
     /// # Errors
     /// Propagates any `candle_core` error from the pinned allocation, the
     /// write into it, or the device copy itself.
-    pub fn clone_htod_capture_safe<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy>(
-        &self,
-        data: &[T],
-    ) -> Result<cudarc::driver::CudaSlice<T>> {
-        if !self.is_capturing() {
-            return self.clone_htod(data);
+    ///
+    /// # Panics
+    /// During the real capture pass, if the pool built by the dry run is
+    /// exhausted, or if the next entry's length does not match `data`'s
+    /// -- both indicate the dry run and the real capture pass took a
+    /// genuinely different code path (a different number, or different
+    /// sizes, of `clone_htod_capture_safe` calls), violating
+    /// `with_capture_arena`'s own "both passes run the exact same op
+    /// sequence" contract. A panic here is the correct failure mode: it
+    /// happens once, at startup, before any real request is ever served
+    /// on the captured path, and the alternative (silently uploading the
+    /// wrong data into a mismatched buffer) would corrupt inference
+    /// output instead.
+    pub fn clone_htod_capture_safe(&self, data: &[usize]) -> Result<cudarc::driver::CudaSlice<usize>> {
+        let mode = self.alloc_mode.load(std::sync::atomic::Ordering::Relaxed);
+        if mode == AllocMode::Measuring as u8 && self.is_current_thread_capturing() {
+            // SAFETY: written in full immediately below, before any
+            // device operation ever reads it.
+            let mut pinned = unsafe { self.alloc_pinned::<usize>(data.len()) }?;
+            pinned.as_mut_slice().map_err(crate::Error::wrap)?.copy_from_slice(data);
+            let result = self.clone_htod(&pinned);
+            self.pinned_scratch.lock().unwrap().push(pinned);
+            return result;
         }
-        // SAFETY: the freshly-allocated pinned slice is written in full
-        // (every element) immediately below, before any device operation
-        // ever reads it.
-        let mut pinned = unsafe { self.alloc_pinned::<T>(data.len()) }?;
-        pinned.as_mut_slice().map_err(crate::Error::wrap)?.copy_from_slice(data);
-        self.clone_htod(&pinned)
+        if mode == AllocMode::Arena as u8 && self.is_current_thread_capturing() {
+            let idx = self.pinned_scratch_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut guard = self.pinned_scratch.lock().unwrap();
+            let pool_len = guard.len();
+            let pinned = guard.get_mut(idx).unwrap_or_else(|| {
+                panic!(
+                    "CudaDevice::clone_htod_capture_safe: pinned scratch pool exhausted at \
+                     index {idx} (pool has {pool_len} entries) -- the dry run and the real \
+                     capture pass made a different number of clone_htod_capture_safe calls"
+                )
+            });
+            assert_eq!(
+                pinned.len(),
+                data.len(),
+                "CudaDevice::clone_htod_capture_safe: pinned scratch pool entry {idx} has \
+                 length {} but this call needs {} -- the dry run and the real capture pass \
+                 requested different sizes at the same call-order position",
+                pinned.len(),
+                data.len()
+            );
+            pinned.as_mut_slice().map_err(crate::Error::wrap)?.copy_from_slice(data);
+            return self.clone_htod(pinned);
+        }
+        self.clone_htod(data)
     }
 }
 
@@ -725,6 +784,8 @@ impl CudaDevice {
             capture_arena: Arc::new(Mutex::new(None)),
             capture_gate: Arc::new(RwLock::new(())),
             capturing_thread: Arc::new(Mutex::new(None)),
+            pinned_scratch: Arc::new(Mutex::new(Vec::new())),
+            pinned_scratch_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -842,6 +903,8 @@ impl CudaDevice {
         let _capturing_thread_guard = CapturingThreadGuard(&self.capturing_thread);
 
         self.measured_sizes.lock().unwrap().clear();
+        self.pinned_scratch.lock().unwrap().clear();
+        self.pinned_scratch_cursor.store(0, Ordering::Relaxed);
         self.alloc_mode.store(AllocMode::Measuring as u8, Ordering::Relaxed);
         let dry_run_result = dry_run();
         self.alloc_mode.store(AllocMode::Normal as u8, Ordering::Relaxed);
@@ -868,6 +931,7 @@ impl CudaDevice {
             total_bytes,
             cursor: std::sync::atomic::AtomicUsize::new(0),
         });
+        self.pinned_scratch_cursor.store(0, Ordering::Relaxed);
         self.alloc_mode.store(AllocMode::Arena as u8, Ordering::Relaxed);
 
         let capture_result = capture();
@@ -920,6 +984,8 @@ impl BackendDevice for CudaDevice {
             capture_arena: Arc::new(Mutex::new(None)),
             capture_gate: Arc::new(RwLock::new(())),
             capturing_thread: Arc::new(Mutex::new(None)),
+            pinned_scratch: Arc::new(Mutex::new(Vec::new())),
+            pinned_scratch_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
