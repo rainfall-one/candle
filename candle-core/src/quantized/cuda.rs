@@ -2,7 +2,7 @@ use super::{GgmlDType, QStorage};
 use crate::quantized::k_quants::GgmlType;
 use crate::{backend::BackendDevice, cuda_backend::WrapErr};
 use crate::{builder_arg as barg, CudaDevice, CudaStorage, Result};
-use half::f16;
+use half::{bf16, f16};
 
 use cudarc::driver::{CudaSlice, CudaView, PushKernelArg};
 
@@ -98,6 +98,73 @@ fn quantize_q8_1(
     }
 
     Ok(())
+}
+
+// BF16-input sibling of `quantize_q8_1` -- identical chunking and
+// launch geometry, dispatching to the `quantize_q8_1_bf16` kernel so a
+// BF16 activation row quantizes directly (no separate BF16->F32 cast
+// pass; that cast was one graph node per MoE layer per token in the
+// consuming project's captured decode graph).
+fn quantize_q8_1_from_bf16(
+    src: &CudaView<bf16>,
+    dst: &mut CudaSlice<u8>,
+    k: usize,
+    ky: usize,
+    dev: &CudaDevice,
+) -> Result<()> {
+    let kx_padded = pad(k, MATRIX_ROW_PADDING);
+    let num_blocks = ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE);
+
+    let total_rows = ky;
+    let q8_1_block_size = GgmlDType::Q8_1.block_size();
+    let q8_1_type_size = GgmlDType::Q8_1.type_size();
+    let num_blocks_per_row = kx_padded / q8_1_block_size;
+    let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
+
+    const CHUNK_SIZE: usize = 65535; // gridDim.y limit
+    let func = dev.get_or_load_func("quantize_q8_1_bf16", &candle_kernels::QUANTIZED)?;
+
+    let mut rows_processed = 0;
+    while rows_processed < total_rows {
+        let remaining_rows = total_rows - rows_processed;
+        let rows_in_chunk = std::cmp::min(CHUNK_SIZE, remaining_rows);
+
+        let src_start_elem = rows_processed * k;
+        let src_num_elems = rows_in_chunk * k;
+        let src_chunk = src.slice(src_start_elem..(src_start_elem + src_num_elems));
+
+        let dst_start_byte = rows_processed * dst_row_size_bytes;
+        let dst_num_bytes = rows_in_chunk * dst_row_size_bytes;
+        let dst_chunk = dst.slice(dst_start_byte..(dst_start_byte + dst_num_bytes));
+
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (num_blocks as u32, rows_in_chunk as u32, 1),
+            block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = func.builder();
+        builder.arg(&src_chunk);
+        builder.arg(&dst_chunk);
+        barg!(builder, k as i32, kx_padded as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+
+        rows_processed += rows_in_chunk;
+    }
+
+    Ok(())
+}
+
+/// The activation-input storage `indexed_moe_forward` quantizes on the
+/// fly -- F32 (the historical path) or BF16 (quantized directly, no
+/// widening cast pass). Views, not whole slices: the caller slices at
+/// the input layout's start offset, which the historical path silently
+/// ignored (latent -- its F32 inputs were always fresh offset-0 cast
+/// outputs; a BF16 narrow view exposed it as garbage activations,
+/// caught live 2026-08-28).
+enum IndexedMoeInput<'a> {
+    F32(CudaView<'a, f32>),
+    Bf16(CudaView<'a, bf16>),
 }
 
 fn dequantize_f32(
@@ -441,7 +508,7 @@ fn indexed_moe_forward_fused_q8_1_input(
     weight: &CudaView<u8>,
     w_shape: &crate::Shape, //[num_experts, n, k]
     w_dtype: GgmlDType,
-    input: &CudaSlice<f32>,
+    input: IndexedMoeInput<'_>,
     in_shape: &crate::Shape, //[batch, topk or 1, k]
     ids: &CudaView<u32>,
     idx_shape: &crate::Shape, //[batch, topk]
@@ -476,8 +543,14 @@ fn indexed_moe_forward_fused_q8_1_input(
         dev.alloc_zeros::<u8>(y_size_in_bytes)?
     };
 
-    let input_view = input.slice(0..);
-    quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
+    match &input {
+        IndexedMoeInput::F32(view) => {
+            quantize_q8_1(view, &mut input_quant, k, total_rows, dev)?;
+        }
+        IndexedMoeInput::Bf16(view) => {
+            quantize_q8_1_from_bf16(view, &mut input_quant, k, total_rows, dev)?;
+        }
+    }
 
     // output buffer
     let outsize = batch * topk * n;
@@ -552,13 +625,28 @@ impl QCudaStorage {
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
         ) {
-            let input_storage = input.as_cuda_slice::<f32>()?;
+            // Dtype-dispatched activation input: BF16 rows quantize
+            // directly (no separate widening cast pass -- see
+            // `quantize_q8_1_from_bf16`); F32 keeps the historical path.
+            use crate::backend::BackendStorage;
+            use crate::DType;
+            let input_enum = match input.dtype() {
+                DType::F32 => {
+                    IndexedMoeInput::F32(input.as_cuda_slice::<f32>()?.slice(input_l.start_offset()..))
+                }
+                DType::BF16 => {
+                    IndexedMoeInput::Bf16(input.as_cuda_slice::<bf16>()?.slice(input_l.start_offset()..))
+                }
+                other => crate::bail!(
+                    "indexed_moe_forward input must be F32 or BF16, got {other:?}"
+                ),
+            };
             let ids_storage = ids.as_cuda_slice::<u32>()?;
             indexed_moe_forward_fused_q8_1_input(
                 &self.data.inner.slice(0..),
                 self_shape, //[num_experts, n, k]
                 self.dtype(),
-                input_storage,
+                input_enum,
                 input_l.shape(), //[batch, topk or 1, k]
                 &ids_storage.slice(0..),
                 ids_l.shape(), //[batch, topk]

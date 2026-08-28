@@ -3381,6 +3381,47 @@ extern "C" __global__ void quantize_q8_1(const float * __restrict__ x, void * __
     reinterpret_cast<half&>(y[ib].ds.y) = sum;
 }
 
+// BF16-input sibling of quantize_q8_1 (rainfall-one, 2026-08-28):
+// identical quantization arithmetic, but the activation loads widen
+// from BF16 instead of requiring a separate BF16->F32 cast pass first
+// -- that cast was one graph node per MoE layer per token in the
+// consuming project's captured decode graph.
+extern "C" __global__ void quantize_q8_1_bf16(const __nv_bfloat16 * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
+    const int ix = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (ix >= kx_padded) {
+        return;
+    }
+
+    const int iy = blockDim.y*blockIdx.y + threadIdx.y;
+
+    const int i_padded = iy*kx_padded + ix;
+
+    block_q8_1 * y = (block_q8_1 *) vy;
+
+    const int ib = i_padded / QK8_1; // block index
+    const int iqs = i_padded % QK8_1; // quant index
+
+    const float xi = ix < kx ? __bfloat162float(x[iy*kx + ix]) : 0.0f;
+    float amax = fabsf(xi);
+    float sum = xi;
+
+    amax = warp_reduce_max(amax);
+    sum = warp_reduce_sum(sum);
+
+    const float d = amax / 127;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    y[ib].qs[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    reinterpret_cast<half&>(y[ib].ds.x) = d;
+    reinterpret_cast<half&>(y[ib].ds.y) = sum;
+}
+
 // Kernels from https://github.com/ggerganov/llama.cpp/blob/master/ggml-cuda/mmq.cu
 
 template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q5_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
