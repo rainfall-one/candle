@@ -289,7 +289,20 @@ fn mul_mat_vec_via_q8_1(
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    // Zero-init ONLY when a padded tail exists: `quantize_q8_1` writes
+    // exactly `ncols` worth of blocks per row and the matmul kernel
+    // reads the padded width, so a tail must be zeroed -- but when
+    // `ncols` is already a multiple of MATRIX_ROW_PADDING there is no
+    // tail and the memset is pure overhead (inside a CUDA graph capture
+    // it also records a memset node per call -- audited live at
+    // 240/decode-step on rainfall-one's Cerebra, 2026-08-28).
+    // SAFETY (alloc branch): no padded tail exists, so `quantize_q8_1`
+    // below overwrites every byte before any read.
+    let mut y_q8_1 = if ncols_padded == ncols {
+        unsafe { dev.alloc::<u8>(y_size_in_bytes) }?
+    } else {
+        dev.alloc_zeros::<u8>(y_size_in_bytes)?
+    };
     quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
 
     let kernel_name = match dtype {
@@ -307,7 +320,12 @@ fn mul_mat_vec_via_q8_1(
     };
     let kernel_name = format!("{kernel_name}{b_size}");
     let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
-    let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
+    // SAFETY: every `mul_mat_vec_*_q8_1_cuda` kernel writes each of its
+    // `nrows * b_size` output elements exactly once (per-row guard then
+    // unconditional store) -- no element is read-modify-written, so the
+    // zero-init this replaced was pure overhead (and one memset graph
+    // node per call inside a capture).
+    let dst = unsafe { dev.alloc::<f32>(nrows * b_size) }?;
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
@@ -362,7 +380,15 @@ fn mul_mat_via_q8_1(
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         k_padded * y_cols * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    // Padded-tail-only zero-init -- see mul_mat_vec_via_q8_1's own
+    // comment for the reasoning (identical situation).
+    // SAFETY (alloc branch): no padded tail, quantize_q8_1 overwrites
+    // every byte before any read.
+    let mut y_q8_1 = if k_padded == k {
+        unsafe { dev.alloc::<u8>(y_size_in_bytes) }?
+    } else {
+        dev.alloc_zeros::<u8>(y_size_in_bytes)?
+    };
     quantize_q8_1(y, &mut y_q8_1, k, y_cols, dev)?;
 
     let (kernel_name, mmq_x, mmq_y) = match dtype {
@@ -379,7 +405,11 @@ fn mul_mat_via_q8_1(
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
-    let dst = dev.alloc_zeros::<f32>(x_rows * y_cols)?;
+    // SAFETY: the mul_mat_q* (MMQ) kernels write every in-bounds dst
+    // element exactly once (bounds-guarded tiles, final store of the
+    // fully-reduced sum -- never read-modify-write), so zero-init was
+    // pure overhead.
+    let dst = unsafe { dev.alloc::<f32>(x_rows * y_cols) }?;
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (
             ceil_div(x_rows, mmq_y) as u32,
@@ -435,14 +465,30 @@ fn indexed_moe_forward_fused_q8_1_input(
     let num_blocks_per_row = k_padded / q8_1_block_size;
     let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
     let y_size_in_bytes = total_rows * dst_row_size_bytes;
-    let mut input_quant = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    // Padded-tail-only zero-init -- see mul_mat_vec_via_q8_1's own
+    // comment. (The indexed kernel's dot loop additionally never reads
+    // past `k`'s own blocks, but the conditional stays conservative.)
+    // SAFETY (alloc branch): no padded tail, quantize_q8_1 overwrites
+    // every byte before any read.
+    let mut input_quant = if k_padded == k {
+        unsafe { dev.alloc::<u8>(y_size_in_bytes) }?
+    } else {
+        dev.alloc_zeros::<u8>(y_size_in_bytes)?
+    };
 
     let input_view = input.slice(0..);
     quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
 
     // output buffer
     let outsize = batch * topk * n;
-    let out = dev.alloc_zeros::<f32>(outsize)?;
+    // SAFETY: `indexed_moe_forward` writes every (task, row) output
+    // element exactly once (`current_output_ptr[row0] = tmp`,
+    // unconditional store, grid covers n x batch x topk) -- the
+    // zero-init this replaced was pure overhead, and inside a CUDA
+    // graph capture it recorded one memset node per call (audited live
+    // at 240 memset nodes/decode-step on rainfall-one's Cerebra:
+    // 3 calls x ~40 MoE layers x 2 buffers, 2026-08-28).
+    let out = unsafe { dev.alloc::<f32>(outsize) }?;
 
     let kernel_name = match w_dtype {
         GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
