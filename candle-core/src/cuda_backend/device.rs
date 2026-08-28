@@ -260,6 +260,18 @@ pub struct CudaDevice {
     /// alive at a time, but it is NOT torn down merely because the
     /// call that built it returned.
     capture_arena: Arc<Mutex<Option<CaptureArena>>>,
+    /// A fixed cuBLAS workspace, set once via
+    /// [`CudaDevice::ensure_cublas_workspace`] and kept alive for the
+    /// device's lifetime. Without it, cuBLAS/cublasLt allocate their
+    /// workspace via `cudaMallocAsync` PER CALL — measured live
+    /// (rainfall-one, 2026-08-28, `cuGraphGetNodes` audit of a captured
+    /// Cerebra decode step): 112 MEM_ALLOC + 112 MEM_FREE nodes in the
+    /// captured graph, all library-internal, which limits the graph to a
+    /// single instantiated exec (`CUDA_ERROR_NOT_SUPPORTED` on any
+    /// second `cuGraphInstantiate`) and therefore blocks multi-exec
+    /// pipelined replay. Pre-setting the workspace is the same fix
+    /// llama.cpp applies for graph-captured decode.
+    cublas_workspace: Arc<Mutex<Option<cudarc::driver::CudaSlice<u8>>>>,
     /// Guards against a real concurrent allocation racing a capture
     /// window. `alloc_mode` alone is not enough to make `Measuring`/
     /// `Arena` mode safe under concurrency: it is a single device-wide
@@ -502,9 +514,20 @@ impl CudaDevice {
             // device operation ever reads it.
             let mut pinned = unsafe { self.alloc_pinned::<usize>(data.len()) }?;
             pinned.as_mut_slice().map_err(crate::Error::wrap)?.copy_from_slice(data);
-            let result = self.clone_htod(&pinned);
+            // Device side via `self.alloc` (NOT `clone_htod`'s internal
+            // `stream.alloc`) so the allocation is measured into the
+            // arena plan -- the real capture pass below must bump-alloc
+            // this same buffer from the arena, and an unmeasured raw
+            // stream alloc there would instead record a MEM_ALLOC graph
+            // node (confirmed live 2026-08-28 via the node audit: 71
+            // such nodes, one per metadata upload, each limiting the
+            // captured graph to a single instantiated exec).
+            // SAFETY: written in full by the memcpy below before any
+            // device operation reads it.
+            let mut dst = unsafe { self.alloc::<usize>(data.len()) }?;
+            self.memcpy_htod(&pinned, &mut dst)?;
             self.pinned_scratch.lock().unwrap().push(pinned);
-            return result;
+            return Ok(dst);
         }
         if mode == AllocMode::Arena as u8 && self.is_current_thread_capturing() {
             let idx = self.pinned_scratch_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -536,7 +559,18 @@ impl CudaDevice {
             // this pinned buffer's memory between then and now.
             let ptr = unsafe { pinned.as_mut_ptr_unsynchronized() };
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
-            return self.clone_htod(pinned);
+            // Device side bump-allocated from the arena (`self.alloc` in
+            // Arena mode) + an explicit pinned-to-device memcpy -- the
+            // memcpy records as a plain (multi-exec-safe) memcpy node,
+            // where `clone_htod`'s internal `stream.alloc` would record
+            // a MEM_ALLOC node and cap the graph at one exec. The
+            // borrow-then-copy split keeps `pinned`'s `&mut` borrow from
+            // the pool guard alive only for the memcpy itself.
+            // SAFETY: written in full by this recorded memcpy (replayed
+            // on every launch) before the step's kernels read it.
+            let mut dst = unsafe { self.alloc::<usize>(data.len()) }?;
+            self.stream.memcpy_htod(&*pinned, &mut dst).w()?;
+            return Ok(dst);
         }
         self.clone_htod(data)
     }
@@ -711,6 +745,47 @@ impl CudaDevice {
     pub fn cublas_handle(&self) -> Arc<cudarc::cublas::CudaBlas> {
         self.blas.clone()
     }
+
+    /// Allocate a fixed cuBLAS workspace of `bytes` once (idempotent —
+    /// later calls with any size are no-ops once one is set) and point
+    /// the device's cuBLAS handle at it via `cublasSetWorkspace_v2`.
+    /// The buffer stays alive for the device's lifetime.
+    ///
+    /// Why (see the `cublas_workspace` field doc for the measurements):
+    /// without an explicit workspace, cuBLAS/cublasLt `cudaMallocAsync`
+    /// their workspace per call; inside a CUDA-graph capture each of
+    /// those becomes a MEM_ALLOC/MEM_FREE node pair, and a graph
+    /// containing memory nodes can only ever have ONE instantiated
+    /// exec — blocking multi-exec pipelined replay. MUST be called
+    /// OUTSIDE any capture window (it allocates for real).
+    pub fn ensure_cublas_workspace(&self, bytes: usize) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        let mut guard = self.cublas_workspace.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
+        let workspace = unsafe { self.stream.alloc::<u8>(bytes) }.w()?;
+        {
+            let (ptr, _sync) = workspace.device_ptr(&self.stream);
+            // SAFETY: `workspace` is a live device allocation of exactly
+            // `bytes` bytes, kept alive by the `Some(...)` store below
+            // for the device's (and therefore the handle's) lifetime.
+            let status = unsafe {
+                cudarc::cublas::sys::cublasSetWorkspace_v2(
+                    *self.blas.handle(),
+                    ptr as usize as *mut core::ffi::c_void,
+                    bytes,
+                )
+            };
+            if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(crate::Error::Msg(format!(
+                    "cublasSetWorkspace_v2 failed: {status:?}"
+                )));
+            }
+        }
+        *guard = Some(workspace);
+        Ok(())
+    }
 }
 
 impl CudaDevice {
@@ -799,6 +874,7 @@ impl CudaDevice {
             alloc_mode: Arc::new(std::sync::atomic::AtomicU8::new(AllocMode::Normal as u8)),
             measured_sizes: Arc::new(Mutex::new(Vec::new())),
             capture_arena: Arc::new(Mutex::new(None)),
+            cublas_workspace: Arc::new(Mutex::new(None)),
             capture_gate: Arc::new(RwLock::new(())),
             capturing_thread: Arc::new(Mutex::new(None)),
             pinned_scratch: Arc::new(Mutex::new(Vec::new())),
@@ -1019,6 +1095,7 @@ impl BackendDevice for CudaDevice {
             alloc_mode: Arc::new(std::sync::atomic::AtomicU8::new(AllocMode::Normal as u8)),
             measured_sizes: Arc::new(Mutex::new(Vec::new())),
             capture_arena: Arc::new(Mutex::new(None)),
+            cublas_workspace: Arc::new(Mutex::new(None)),
             capture_gate: Arc::new(RwLock::new(())),
             capturing_thread: Arc::new(Mutex::new(None)),
             pinned_scratch: Arc::new(Mutex::new(Vec::new())),
