@@ -165,6 +165,12 @@ fn quantize_q8_1_from_bf16(
 enum IndexedMoeInput<'a> {
     F32(CudaView<'a, f32>),
     Bf16(CudaView<'a, bf16>),
+    /// Activation rows ALREADY quantized to Q8_1 blocks by the caller
+    /// (e.g. a producer kernel fusing its epilogue with quantization) --
+    /// the internal quantize pass is skipped entirely. The U8 tensor's
+    /// last dim is `k_padded / 32 * 36` bytes per row, exactly the
+    /// buffer this function would otherwise build.
+    Q8_1(CudaView<'a, u8>),
 }
 
 fn dequantize_f32(
@@ -537,20 +543,37 @@ fn indexed_moe_forward_fused_q8_1_input(
     // past `k`'s own blocks, but the conditional stays conservative.)
     // SAFETY (alloc branch): no padded tail, quantize_q8_1 overwrites
     // every byte before any read.
-    let mut input_quant = if k_padded == k {
-        unsafe { dev.alloc::<u8>(y_size_in_bytes) }?
-    } else {
-        dev.alloc_zeros::<u8>(y_size_in_bytes)?
-    };
-
-    match &input {
+    // A pre-quantized (Q8_1) input skips the buffer and the quantize
+    // pass entirely -- the caller's blocks feed the kernel directly.
+    let input_quant_owned = match &input {
+        IndexedMoeInput::Q8_1(view) => {
+            if view.len() < y_size_in_bytes {
+                crate::bail!(
+                    "indexed_moe_forward: pre-quantized input holds {} bytes, needs {y_size_in_bytes}",
+                    view.len()
+                );
+            }
+            None
+        }
         IndexedMoeInput::F32(view) => {
-            quantize_q8_1(view, &mut input_quant, k, total_rows, dev)?;
+            let mut buf = if k_padded == k {
+                unsafe { dev.alloc::<u8>(y_size_in_bytes) }?
+            } else {
+                dev.alloc_zeros::<u8>(y_size_in_bytes)?
+            };
+            quantize_q8_1(view, &mut buf, k, total_rows, dev)?;
+            Some(buf)
         }
         IndexedMoeInput::Bf16(view) => {
-            quantize_q8_1_from_bf16(view, &mut input_quant, k, total_rows, dev)?;
+            let mut buf = if k_padded == k {
+                unsafe { dev.alloc::<u8>(y_size_in_bytes) }?
+            } else {
+                dev.alloc_zeros::<u8>(y_size_in_bytes)?
+            };
+            quantize_q8_1_from_bf16(view, &mut buf, k, total_rows, dev)?;
+            Some(buf)
         }
-    }
+    };
 
     // output buffer
     let outsize = batch * topk * n;
@@ -582,7 +605,15 @@ fn indexed_moe_forward_fused_q8_1_input(
 
     let mut builder = func.builder();
     builder.arg(weight);
-    builder.arg(&input_quant);
+    match (&input, &input_quant_owned) {
+        (IndexedMoeInput::Q8_1(view), _) => {
+            builder.arg(view);
+        }
+        (_, Some(buf)) => {
+            builder.arg(buf);
+        }
+        _ => unreachable!("non-Q8_1 inputs always build an owned quantize buffer above"),
+    }
     builder.arg(ids);
     builder.arg(&out);
 
@@ -637,8 +668,13 @@ impl QCudaStorage {
                 DType::BF16 => {
                     IndexedMoeInput::Bf16(input.as_cuda_slice::<bf16>()?.slice(input_l.start_offset()..))
                 }
+                // A U8 input is the caller's own Q8_1 block stream --
+                // pre-quantized by a producer kernel, consumed directly.
+                DType::U8 => {
+                    IndexedMoeInput::Q8_1(input.as_cuda_slice::<u8>()?.slice(input_l.start_offset()..))
+                }
                 other => crate::bail!(
-                    "indexed_moe_forward input must be F32 or BF16, got {other:?}"
+                    "indexed_moe_forward input must be F32, BF16, or U8 (pre-quantized Q8_1), got {other:?}"
                 ),
             };
             let ids_storage = ids.as_cuda_slice::<u32>()?;
