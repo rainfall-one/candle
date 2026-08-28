@@ -495,18 +495,14 @@ impl CudaDevice {
     /// Propagates any `candle_core` error from the pinned allocation, the
     /// write into it, or the device copy itself.
     ///
-    /// # Panics
-    /// During the real capture pass, if the pool built by the dry run is
-    /// exhausted, or if the next entry's length does not match `data`'s
-    /// -- both indicate the dry run and the real capture pass took a
-    /// genuinely different code path (a different number, or different
-    /// sizes, of `clone_htod_capture_safe` calls), violating
-    /// `with_capture_arena`'s own "both passes run the exact same op
-    /// sequence" contract. A panic here is the correct failure mode: it
-    /// happens once, at startup, before any real request is ever served
-    /// on the captured path, and the alternative (silently uploading the
-    /// wrong data into a mismatched buffer) would corrupt inference
-    /// output instead.
+    /// During the real capture pass, a pool exhausted at the current
+    /// index or an entry-length mismatch against `data` -- both meaning
+    /// the sizing plan (dry run or cached) and the real capture pass took
+    /// genuinely different code paths -- returns a typed error (NOT a
+    /// panic: a panic here holds the capture gate's write lock and would
+    /// poison it, wedging every later allocation on the device --
+    /// confirmed live 2026-08-28). The capture closure then fails
+    /// cleanly and the caller falls back to eager decode.
     pub fn clone_htod_capture_safe(&self, data: &[usize]) -> Result<cudarc::driver::CudaSlice<usize>> {
         let mode = self.alloc_mode.load(std::sync::atomic::Ordering::Relaxed);
         if mode == AllocMode::Measuring as u8 && self.is_current_thread_capturing() {
@@ -533,22 +529,29 @@ impl CudaDevice {
             let idx = self.pinned_scratch_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut guard = self.pinned_scratch.lock().unwrap();
             let pool_len = guard.len();
-            let pinned = guard.get_mut(idx).unwrap_or_else(|| {
-                panic!(
+            // Typed errors, NOT panics (changed 2026-08-28): a panic here
+            // while the capture gate's write lock is held poisons that
+            // lock and wedges every later allocation on the device
+            // (confirmed live: one mismatched presized capture killed the
+            // whole service). An error unwinds cleanly through the
+            // capture closure instead, letting the caller fall back to
+            // eager decode and invalidate any cached arena plan.
+            let Some(pinned) = guard.get_mut(idx) else {
+                crate::bail!(
                     "CudaDevice::clone_htod_capture_safe: pinned scratch pool exhausted at \
-                     index {idx} (pool has {pool_len} entries) -- the dry run and the real \
+                     index {idx} (pool has {pool_len} entries) -- the sizing plan and the real \
                      capture pass made a different number of clone_htod_capture_safe calls"
                 )
-            });
-            assert_eq!(
-                pinned.len(),
-                data.len(),
-                "CudaDevice::clone_htod_capture_safe: pinned scratch pool entry {idx} has \
-                 length {} but this call needs {} -- the dry run and the real capture pass \
-                 requested different sizes at the same call-order position",
-                pinned.len(),
-                data.len()
-            );
+            };
+            if pinned.len() != data.len() {
+                crate::bail!(
+                    "CudaDevice::clone_htod_capture_safe: pinned scratch pool entry {idx} has \
+                     length {} but this call needs {} -- the sizing plan and the real capture \
+                     pass requested different sizes at the same call-order position",
+                    pinned.len(),
+                    data.len()
+                );
+            }
             // SAFETY: this exact pool entry was allocated during the dry
             // run (AllocMode::Measuring, above) and has only ever been
             // written by that dry run's own `clone_htod` upload -- by the
@@ -980,6 +983,100 @@ impl CudaDevice {
     /// either closure directly -- if `dry_run` returns `Err`, `capture`
     /// never runs (there is nothing to size the arena from) and that
     /// `Err` is returned immediately as `Ok(Err(..))`.
+    /// Build (or replace) the capture arena from an explicit list of
+    /// allocation sizes -- the shared tail of [`Self::with_capture_arena`]
+    /// and [`Self::with_capture_arena_presized`]. Caller must hold the
+    /// capture gate's write lock.
+    fn install_capture_arena(&self, sizes: &[usize]) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let total_bytes: usize = sizes.iter().map(|&b| arena_align(b)).sum();
+        // SAFETY: the arena's own backing bytes are immediately handed to
+        // `CaptureArena`, which never exposes them as `T`-typed data
+        // until a `bump_alloc` view is constructed over a sub-range a
+        // caller is about to write into -- matching every other
+        // `alloc`/`alloc_uninit` caller's own established contract in
+        // this file (uninitialized until written).
+        let backing = unsafe { self.stream.alloc::<u8>(total_bytes.max(1)) }.w()?;
+        let base_ptr = {
+            use cudarc::driver::DevicePtr;
+            backing.device_ptr(&self.stream).0
+        };
+        *self.capture_arena.lock().unwrap() = Some(CaptureArena {
+            _backing: backing,
+            base_ptr,
+            total_bytes,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+        });
+        self.pinned_scratch_cursor.store(0, Ordering::Relaxed);
+        self.alloc_mode.store(AllocMode::Arena as u8, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The full arena plan measured by the most recent successful
+    /// [`Self::with_capture_arena`] dry run: `(arena allocation sizes,
+    /// pinned-scratch entry lengths)` -- retrievable until the next
+    /// capture call clears them. Cache these (keyed by whatever
+    /// determines the capture's allocation shapes) and hand them back to
+    /// [`Self::with_capture_arena_presized`] to skip a later,
+    /// shape-identical capture's whole dry-run pass. Both halves are
+    /// needed: the arena sizes plan the device bump allocator, and the
+    /// pinned lengths rebuild the metadata-upload staging pool
+    /// (`clone_htod_capture_safe`'s dry-run-built pool -- confirmed live
+    /// 2026-08-28: presizing the arena alone left that pool empty, and
+    /// the capture pass panicked at its first metadata upload).
+    pub fn capture_arena_plan(&self) -> (Vec<usize>, Vec<usize>) {
+        let arena_sizes = self.measured_sizes.lock().unwrap().clone();
+        let pinned_sizes = self.pinned_scratch.lock().unwrap().iter().map(|p| p.len()).collect();
+        (arena_sizes, pinned_sizes)
+    }
+
+    /// [`Self::with_capture_arena`] minus the dry run: builds the arena
+    /// and the pinned-scratch staging pool straight from a previous
+    /// shape-identical capture's [`Self::capture_arena_plan`] and runs
+    /// `capture` inside them. If the plan under-provisions the real
+    /// capture's allocations, the arena's `bump_alloc` (or the pinned
+    /// pool's own exhaustion check) surfaces that as `capture`'s error
+    /// or panic -- the caller should invalidate its cache and fall back
+    /// to the measuring path. Same locking, mode transitions, and
+    /// leave-the-arena-alive semantics as the measuring variant.
+    ///
+    /// # Errors
+    /// Outer [`Result`]: arena-machinery failures (the backing or pinned
+    /// allocations). Inner result: `capture`'s own.
+    pub fn with_capture_arena_presized<R, E>(
+        &self,
+        arena_sizes: &[usize],
+        pinned_sizes: &[usize],
+        capture: impl FnOnce() -> std::result::Result<R, E>,
+    ) -> Result<std::result::Result<R, E>> {
+        use std::sync::atomic::Ordering;
+        let _gate = self.capture_gate.write().unwrap();
+        *self.capturing_thread.lock().unwrap() = Some(std::thread::current().id());
+        let _capturing_thread_guard = CapturingThreadGuard(&self.capturing_thread);
+
+        // Rebuild the metadata staging pool at the recorded lengths.
+        // Content is irrelevant: the capture pass overwrites each entry
+        // with its own metadata before the async upload reads it.
+        {
+            let mut pool = self.pinned_scratch.lock().unwrap();
+            pool.clear();
+            for &len in pinned_sizes {
+                // SAFETY: overwritten in full by the capture pass's own
+                // copy_from_slice before any device operation reads it.
+                pool.push(unsafe { self.alloc_pinned::<usize>(len) }?);
+            }
+        }
+        self.pinned_scratch_cursor.store(0, Ordering::Relaxed);
+        self.install_capture_arena(arena_sizes)?;
+
+        let capture_result = capture();
+
+        self.alloc_mode.store(AllocMode::Normal as u8, Ordering::Relaxed);
+        // The arena stays alive after return -- same contract as
+        // `with_capture_arena` (see that function's trailing comment).
+        Ok(capture_result)
+    }
+
     pub fn with_capture_arena<R, E>(
         &self,
         dry_run: impl FnOnce() -> std::result::Result<R, E>,
@@ -1012,26 +1109,15 @@ impl CudaDevice {
         if std::env::var("CEREBRA_ARENA_DEBUG").is_ok() {
             eprintln!("ARENA_DEBUG dry_run sizes ({}): {:?}", sizes.len(), sizes);
         }
-        let total_bytes: usize = sizes.iter().map(|&b| arena_align(b)).sum();
-        // SAFETY: the arena's own backing bytes are immediately handed to
-        // `CaptureArena`, which never exposes them as `T`-typed data
-        // until a `bump_alloc` view is constructed over a sub-range a
-        // caller is about to write into -- matching every other
-        // `alloc`/`alloc_uninit` caller's own established contract in
-        // this file (uninitialized until written).
-        let backing = unsafe { self.stream.alloc::<u8>(total_bytes.max(1)) }.w()?;
-        let base_ptr = {
-            use cudarc::driver::DevicePtr;
-            backing.device_ptr(&self.stream).0
-        };
-        *self.capture_arena.lock().unwrap() = Some(CaptureArena {
-            _backing: backing,
-            base_ptr,
-            total_bytes,
-            cursor: std::sync::atomic::AtomicUsize::new(0),
-        });
-        self.pinned_scratch_cursor.store(0, Ordering::Relaxed);
-        self.alloc_mode.store(AllocMode::Arena as u8, Ordering::Relaxed);
+        self.install_capture_arena(&sizes)?;
+        // Leave the measured sizes retrievable after this call
+        // ([`Self::capture_arena_measured_sizes`]) so a caller can cache
+        // them and skip the whole dry-run pass on a later, shape-identical
+        // capture via [`Self::with_capture_arena_presized`]. `record_measured`
+        // only appends in `Measuring` mode, so re-storing them here cannot
+        // be corrupted by ordinary allocations, and the next capture's own
+        // `clear()` above resets them.
+        *self.measured_sizes.lock().unwrap() = sizes;
 
         let capture_result = capture();
 
