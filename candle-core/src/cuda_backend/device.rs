@@ -659,6 +659,22 @@ impl CudaDevice {
         self.stream.clone()
     }
 
+    /// Whether the MAIN stream is currently inside a CUDA graph capture.
+    /// Callers use this to gate side-branch forking to capture-time only
+    /// (rainfall-one, 2026-08-29): under capture, allocations route to
+    /// the capture arena and nothing is freed, so the fork/join event
+    /// edges are the complete ordering story; in EAGER mode a tensor
+    /// allocated on the side stream frees stream-ordered on the SIDE
+    /// stream, which does not wait for the MAIN stream's enqueued reads
+    /// of that tensor — a measured use-after-free race (nondeterministic
+    /// output on the consuming workload).
+    pub fn is_stream_capturing(&self) -> bool {
+        matches!(
+            self.stream.capture_status(),
+            Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE)
+        )
+    }
+
     /// Begin issuing subsequent work on this device's SIDE stream, after
     /// fencing it behind everything already issued on the main stream
     /// (event fork). Inside a CUDA graph capture this records the side
