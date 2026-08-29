@@ -229,6 +229,15 @@ enum AllocMode {
     Arena = 2,
 }
 
+/// The lazily-created side stream and its fork/join events — see
+/// `CudaDevice::stream_override`'s doc. One per device, reused for every
+/// sequential fork/join pair.
+struct SideBranch {
+    stream: Arc<cudarc::driver::CudaStream>,
+    fork_event: cudarc::driver::CudaEvent,
+    join_event: cudarc::driver::CudaEvent,
+}
+
 #[derive(Clone)]
 pub struct CudaDevice {
     id: DeviceId,
@@ -236,6 +245,26 @@ pub struct CudaDevice {
     modules: Arc<std::sync::RwLock<ModuleStore>>,
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
+    /// Optional SIDE stream override (rainfall-one, 2026-08-29): while
+    /// `Some`, every stream-consuming path in this backend that goes
+    /// through [`Self::active_stream`] — kernel launches via
+    /// `get_or_load(_custom)_func`, alloc/memcpy/memset — issues on the
+    /// side stream instead of the main one. Entered/left via
+    /// [`Self::fork_side_branch`] / [`Self::pause_side_branch`] /
+    /// [`Self::join_side_branch`], which fence the two streams with
+    /// events so the fork/join edges are real dependencies — inside a
+    /// CUDA graph capture this records the side branch as PARALLEL graph
+    /// nodes (multi-stream capture via event fork/join, the documented
+    /// pattern), letting an independent branch (e.g. a Mixture of
+    /// Experts layer's shared expert) execute concurrently with the main
+    /// chain on replay. Shared across device clones (one `Arc`), like
+    /// every other piece of this device's state.
+    stream_override: Arc<RwLock<Option<Arc<cudarc::driver::CudaStream>>>>,
+    /// The lazily-created side stream itself plus the two fork/join
+    /// events, created once and reused for every fork (event-handle
+    /// reuse across sequential fork/join pairs is well-defined both live
+    /// and under capture — each record produces its own graph node).
+    side_branch: Arc<Mutex<Option<SideBranch>>>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     pub(crate) cublas_one_zero: Arc<CublasOneZero>,
     curand: Arc<Mutex<CudaRng>>,
@@ -360,7 +389,7 @@ impl CudaDevice {
         let arena = guard
             .as_ref()
             .expect("CudaDevice::alloc_mode is Arena but capture_arena is None -- with_capture_arena's own invariant was violated");
-        arena.bump_alloc::<T>(&self.stream, len)
+        arena.bump_alloc::<T>(&self.active_stream(), len)
     }
 
     #[allow(clippy::missing_safety_doc)]
@@ -378,7 +407,7 @@ impl CudaDevice {
                 self.arena_alloc::<T>(len)
             } else {
                 self.record_measured(len * std::mem::size_of::<T>());
-                self.stream.alloc::<T>(len).w()
+                self.active_stream().alloc::<T>(len).w()
             };
         }
         // Either genuinely Normal, or a DIFFERENT thread observing a
@@ -388,7 +417,7 @@ impl CudaDevice {
         // read guard is held, `alloc_mode` is guaranteed `Normal` -- no
         // writer can be active concurrently with any held read guard.
         let _gate = self.capture_gate.read().unwrap();
-        self.stream.alloc::<T>(len).w()
+        self.active_stream().alloc::<T>(len).w()
     }
 
     pub fn alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
@@ -399,15 +428,15 @@ impl CudaDevice {
         if mode != AllocMode::Normal as u8 && self.is_current_thread_capturing() {
             return if mode == AllocMode::Arena as u8 {
                 let mut slice = self.arena_alloc::<T>(len)?;
-                self.stream.memset_zeros(&mut slice).w()?;
+                self.active_stream().memset_zeros(&mut slice).w()?;
                 Ok(slice)
             } else {
                 self.record_measured(len * std::mem::size_of::<T>());
-                self.stream.alloc_zeros::<T>(len).w()
+                self.active_stream().alloc_zeros::<T>(len).w()
             };
         }
         let _gate = self.capture_gate.read().unwrap();
-        self.stream.alloc_zeros::<T>(len).w()
+        self.active_stream().alloc_zeros::<T>(len).w()
     }
 
     pub fn memcpy_htod<
@@ -419,14 +448,14 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
-        self.stream.memcpy_htod(src, dst).w()
+        self.active_stream().memcpy_htod(src, dst).w()
     }
 
     pub fn clone_dtoh<T: cudarc::driver::DeviceRepr, Src: cudarc::driver::DevicePtr<T>>(
         &self,
         src: &Src,
     ) -> Result<Vec<T>> {
-        self.stream.clone_dtoh(src).w()
+        self.active_stream().clone_dtoh(src).w()
     }
 
     pub fn memcpy_dtod<
@@ -438,7 +467,7 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
-        self.stream.memcpy_dtod(src, dst).w()
+        self.active_stream().memcpy_dtod(src, dst).w()
     }
 
     pub fn memcpy_dtoh<
@@ -450,14 +479,14 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
-        self.stream.memcpy_dtoh(src, dst).w()
+        self.active_stream().memcpy_dtoh(src, dst).w()
     }
 
     pub fn clone_htod<T: cudarc::driver::DeviceRepr, Src: cudarc::driver::HostSlice<T> + ?Sized>(
         &self,
         src: &Src,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
-        self.stream.clone_htod(src).w()
+        self.active_stream().clone_htod(src).w()
     }
 
     /// Upload `data` (always shape/stride metadata in this file -- every
@@ -572,7 +601,7 @@ impl CudaDevice {
             // SAFETY: written in full by this recorded memcpy (replayed
             // on every launch) before the step's kernels read it.
             let mut dst = unsafe { self.alloc::<usize>(data.len()) }?;
-            self.stream.memcpy_htod(&*pinned, &mut dst).w()?;
+            self.active_stream().memcpy_htod(&*pinned, &mut dst).w()?;
             return Ok(dst);
         }
         self.clone_htod(data)
@@ -617,6 +646,62 @@ impl CudaFunc {
 impl CudaDevice {
     pub fn cuda_stream(&self) -> Arc<cudarc::driver::CudaStream> {
         self.stream.clone()
+    }
+
+    /// The stream every stream-consuming path in this backend should
+    /// issue on RIGHT NOW: the side stream while a
+    /// [`Self::fork_side_branch`] scope is active, the main stream
+    /// otherwise. See `stream_override`'s field doc.
+    fn active_stream(&self) -> Arc<cudarc::driver::CudaStream> {
+        if let Some(side) = self.stream_override.read().unwrap().as_ref() {
+            return side.clone();
+        }
+        self.stream.clone()
+    }
+
+    /// Begin issuing subsequent work on this device's SIDE stream, after
+    /// fencing it behind everything already issued on the main stream
+    /// (event fork). Inside a CUDA graph capture this records the side
+    /// work as a PARALLEL branch of the graph. Pair with
+    /// [`Self::pause_side_branch`] (stop redirecting, no fence — main
+    /// work issued after it runs CONCURRENTLY with the side branch) and
+    /// [`Self::join_side_branch`] (main stream waits for the side
+    /// branch). Sequential fork/join pairs reuse one side stream and one
+    /// event pair — well-defined live and under capture.
+    pub fn fork_side_branch(&self) -> Result<()> {
+        let mut guard = self.side_branch.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(SideBranch {
+                stream: self.context.new_stream().w()?,
+                fork_event: self.context.new_event(None).w()?,
+                join_event: self.context.new_event(None).w()?,
+            });
+        }
+        let branch = guard.as_ref().unwrap();
+        branch.fork_event.record(&self.stream).w()?;
+        branch.stream.wait(&branch.fork_event).w()?;
+        *self.stream_override.write().unwrap() = Some(branch.stream.clone());
+        Ok(())
+    }
+
+    /// Stop redirecting work to the side stream WITHOUT fencing — work
+    /// issued on the main stream after this call runs concurrently with
+    /// the side branch until [`Self::join_side_branch`].
+    pub fn pause_side_branch(&self) {
+        *self.stream_override.write().unwrap() = None;
+    }
+
+    /// Fence the main stream behind the side branch (event join). Also
+    /// clears the redirect if still active.
+    pub fn join_side_branch(&self) -> Result<()> {
+        *self.stream_override.write().unwrap() = None;
+        let guard = self.side_branch.lock().unwrap();
+        let Some(branch) = guard.as_ref() else {
+            return Ok(());
+        };
+        branch.join_event.record(&branch.stream).w()?;
+        self.stream.wait(&branch.join_event).w()?;
+        Ok(())
     }
 
     /// `true` iff this device's stream currently has an active CUDA graph
@@ -692,7 +777,7 @@ impl CudaDevice {
         let func = module.load_function(func_name).w()?;
         Ok(CudaFunc {
             func,
-            stream: self.stream.clone(),
+            stream: self.active_stream(),
         })
     }
 
@@ -711,7 +796,7 @@ impl CudaDevice {
             let func = mdl.load_function(fn_name).w()?;
             return Ok(CudaFunc {
                 func,
-                stream: self.stream.clone(),
+                stream: self.active_stream(),
             });
         }
         drop(ms);
@@ -721,7 +806,7 @@ impl CudaDevice {
         let func = cuda_module.load_function(fn_name).w()?;
         Ok(CudaFunc {
             func,
-            stream: self.stream.clone(),
+            stream: self.active_stream(),
         })
     }
 
@@ -731,7 +816,7 @@ impl CudaDevice {
             let func = mdl.load_function(fn_name).w()?;
             return Ok(CudaFunc {
                 func,
-                stream: self.stream.clone(),
+                stream: self.active_stream(),
             });
         }
         drop(ms);
@@ -741,7 +826,7 @@ impl CudaDevice {
         let func = cuda_module.load_function(fn_name).w()?;
         Ok(CudaFunc {
             func,
-            stream: self.stream.clone(),
+            stream: self.active_stream(),
         })
     }
 
@@ -868,6 +953,8 @@ impl CudaDevice {
             id: DeviceId::new(),
             context,
             stream,
+            stream_override: Arc::new(RwLock::new(None)),
+            side_branch: Arc::new(Mutex::new(None)),
             blas: Arc::new(blas),
             cublas_one_zero: Arc::new(cublas_one_zero),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
@@ -1172,6 +1259,8 @@ impl BackendDevice for CudaDevice {
             id: DeviceId::new(),
             context,
             stream,
+            stream_override: Arc::new(RwLock::new(None)),
+            side_branch: Arc::new(Mutex::new(None)),
             blas: Arc::new(blas),
             cublas_one_zero: Arc::new(cublas_one_zero),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
