@@ -597,6 +597,12 @@ fn indexed_moe_forward_fused_q8_1_input(
     let (kernel_name, warp_rows) = match w_dtype {
         GgmlDType::Q2K => ("indexed_moe_forward_q2k_q8_1", false),
         GgmlDType::Q3K => ("indexed_moe_forward_q3k_q8_1", false),
+        // Q4K experiment (2026-08-29): also try warp-rows for the k=2048
+        // gate/up shape (8 k-blocks -> each warp runs 4 serial
+        // iterations, but drops the cross-warp barrier and quarters the
+        // block count). Measured on the consuming workload; revert to
+        // `false` if it does not hold its gain.
+        GgmlDType::Q4K if k / 256 <= 8 => ("indexed_moe_forward_q4k_q8_1_wr", true),
         GgmlDType::Q4K => ("indexed_moe_forward_q4k_q8_1", false),
         GgmlDType::Q5K if small_k => ("indexed_moe_forward_q5k_q8_1_wr", true),
         GgmlDType::Q5K => ("indexed_moe_forward_q5k_q8_1", false),

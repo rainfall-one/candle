@@ -4556,6 +4556,21 @@ __device__ void indexed_moe_forward_warp_rows(
     }
 }
 
+extern "C" __global__ void indexed_moe_forward_q4k_q8_1_wr(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_warp_rows<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
 extern "C" __global__ void indexed_moe_forward_q5k_q8_1_wr(
     const void * __restrict__ all_weights,
     const void * __restrict__ all_inputs,
