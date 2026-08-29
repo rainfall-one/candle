@@ -586,17 +586,31 @@ fn indexed_moe_forward_fused_q8_1_input(
     // 3 calls x ~40 MoE layers x 2 buffers, 2026-08-28).
     let out = unsafe { dev.alloc::<f32>(outsize) }?;
 
-    let kernel_name = match w_dtype {
-        GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
-        GgmlDType::Q3K => "indexed_moe_forward_q3k_q8_1",
-        GgmlDType::Q4K => "indexed_moe_forward_q4k_q8_1",
-        GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
-        GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
-        GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
+    // Warp-per-row variant for SMALL-K rows (rainfall-one, 2026-08-29):
+    // with `k / QK_K <= 4` k-blocks per row, the block-per-row shape
+    // leaves most of its 128 threads idle (measured ~14% of peak
+    // bandwidth on a k=512 Mixture of Experts down projection); the
+    // `_wr` kernels give each of the 4 warps its own row instead
+    // (grid.x = ceil(n / 4), no shared-memory reduction). Only wired
+    // for the dtypes that real down projections use.
+    let small_k = k / 256 <= 4;
+    let (kernel_name, warp_rows) = match w_dtype {
+        GgmlDType::Q2K => ("indexed_moe_forward_q2k_q8_1", false),
+        GgmlDType::Q3K => ("indexed_moe_forward_q3k_q8_1", false),
+        GgmlDType::Q4K => ("indexed_moe_forward_q4k_q8_1", false),
+        GgmlDType::Q5K if small_k => ("indexed_moe_forward_q5k_q8_1_wr", true),
+        GgmlDType::Q5K => ("indexed_moe_forward_q5k_q8_1", false),
+        GgmlDType::Q6K if small_k => ("indexed_moe_forward_q6k_q8_1_wr", true),
+        GgmlDType::Q6K => ("indexed_moe_forward_q6k_q8_1", false),
+        GgmlDType::Q8_0 => ("indexed_moe_forward_q8_0_q8_1", false),
         _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
-    let (nblocks, nwarps) = (n as u32, 4);
+    let (nblocks, nwarps) = if warp_rows {
+        ((n as u32).div_ceil(4), 4)
+    } else {
+        (n as u32, 4)
+    };
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (nblocks, batch as u32, topk as u32),
         block_dim: (WARP_SIZE as u32, nwarps, 1),

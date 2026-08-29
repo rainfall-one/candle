@@ -4487,6 +4487,105 @@ __device__ void indexed_moe_forward(
     }
 }
 
+// Warp-per-row variant (rainfall-one, 2026-08-29) for SMALL-K expert
+// projections: the shared shape above gives every row a whole 128-thread
+// block striding the row's k-blocks, but a Mixture of Experts DOWN
+// projection at k=512 has only `k/qk = 2` k-blocks per row -- measured
+// live (Nsight-derived arithmetic on a real A100 decode profile), just
+// 32 of the 128 threads ever touched data and the call ran at ~280GB/s
+// (~14% of peak). Here each of the block's 4 warps owns ONE row
+// (rows_per_block = 4, grid.x = ceil(n / 4)): a lone warp covers
+// `vdr * 32 / qi` k-blocks per iteration -- exactly the 2 that k=512
+// has -- with every lane active, and the reduction is a single
+// warp_reduce (no shared memory, no barrier). The wrapper selects this
+// variant when `k / qk <= 4`; the general shape remains for wide rows.
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__device__ void indexed_moe_forward_warp_rows(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+
+    const int current_batch = blockIdx.y;
+    const int current_topk = blockIdx.z;
+    const int task_id = current_batch * gridDim.z + current_topk;
+    if (task_id >= gridDim.y * gridDim.z) {
+        return;
+    }
+    const int input_idx = (input_dim1 == 1) ? current_batch : task_id;
+    const unsigned int expert_id = indices[task_id];
+
+    const size_t weight_block_size = sizeof(block_q_t);
+    const size_t input_block_size = sizeof(block_q8_1);
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / QK_K * weight_block_size;
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
+    const size_t output_task_stride_elems = n;
+
+    const void * current_input_ptr  = (const char *)all_inputs  + input_idx * input_task_stride_bytes;
+    const void * current_weight_ptr = (const char *)all_weights + expert_id * weight_expert_stride_bytes;
+    float * current_output_ptr = all_outputs + task_id * output_task_stride_elems;
+
+    constexpr int rows_per_block = 4;
+    const int row = rows_per_block * blockIdx.x + threadIdx.y;
+    if (row >= n) {
+        return;
+    }
+
+    const int blocks_per_row_x = k / qk;
+    constexpr int blocks_per_iter = vdr * WARP_SIZE / qi; // one warp's coverage
+
+    float tmp = 0.0f;
+    const block_q_t * w = (const block_q_t *) current_weight_ptr;
+    const block_q8_1 * x = (const block_q8_1 *) current_input_ptr;
+
+    for (int kbx = (int)threadIdx.x / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * ((int)threadIdx.x % (qi / vdr));
+        tmp += vec_dot_q_cuda(&w[kbx + row * blocks_per_row_x], &x[kby], kqs);
+    }
+
+    tmp = warp_reduce_sum(tmp);
+    if (threadIdx.x == 0) {
+        current_output_ptr[row] = tmp;
+    }
+}
+
+extern "C" __global__ void indexed_moe_forward_q5k_q8_1_wr(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_warp_rows<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q6k_q8_1_wr(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_warp_rows<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
 extern "C" __global__ void indexed_moe_forward_q2k_q8_1(
     const void * __restrict__ all_weights,
     const void * __restrict__ all_inputs,
