@@ -4688,5 +4688,748 @@ extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+// EXPERT-GROUPED variant (rainfall-one, 2026-08-30) for LARGE task
+// counts (continuous batching: batch up to 32, topk 8 -> 256 tasks).
+// The task-major shapes above read the selected expert's weight matrix
+// once per TASK, so tasks sharing an expert multiply HBM weight
+// traffic; at 256 tasks over 128 experts only ~110 experts are unique,
+// and weight bytes dominate the decode tick. Here the grid is
+// EXPERT-major (blockIdx.y = expert id): each block scans the (small)
+// index list into shared memory, exits before touching any weight when
+// no task routed to its expert, and otherwise walks the k-blocks ONCE
+// per row while looping the matching tasks in register tiles -- weight
+// chunks are read from HBM once per active expert (L1-served across the
+// task tile), activation vectors once per (task, row-block).
+//
+// Determinism: each task's accumulation order over k is IDENTICAL to
+// the warp-rows kernel above (same vec_dot chunk order, one warp per
+// row), and per-task sums never mix across tasks, so outputs are
+// bit-identical to the task-major kernels regardless of the shared
+// task list's (atomicAdd-ordered) permutation.
+#define MOE_GROUPED_MAX_TASKS 1024
+#define MOE_GROUPED_TASK_TILE 8
+
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__device__ void indexed_moe_forward_grouped(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+
+    const unsigned int expert_id = blockIdx.y;
+    const int total_tasks = batch * topk;
+
+    // Cooperative scan of the index list: the tasks routed to THIS
+    // block's expert. total_tasks <= 256 u32 reads -- trivial, and the
+    // early exit below means an inactive expert's blocks cost nothing
+    // more than this scan.
+    __shared__ unsigned short task_list[MOE_GROUPED_MAX_TASKS];
+    __shared__ int task_count;
+    const int tid_flat = (int)threadIdx.y * WARP_SIZE + (int)threadIdx.x;
+    if (tid_flat == 0) {
+        task_count = 0;
+    }
+    __syncthreads();
+    for (int t = tid_flat; t < total_tasks; t += (int)(blockDim.x * blockDim.y)) {
+        if (indices[t] == expert_id) {
+            const int slot = atomicAdd(&task_count, 1);
+            if (slot < MOE_GROUPED_MAX_TASKS) {
+                task_list[slot] = (unsigned short)t;
+            }
+        }
+    }
+    __syncthreads();
+    const int count = task_count < MOE_GROUPED_MAX_TASKS ? task_count : MOE_GROUPED_MAX_TASKS;
+    if (count == 0) {
+        return;
+    }
+
+    // Warp-per-row shape (matches the _wr kernels): 4 warps per block,
+    // one output row each.
+    constexpr int rows_per_block = 4;
+    const int row = rows_per_block * blockIdx.x + (int)threadIdx.y;
+    if (row >= n) {
+        return;
+    }
+
+    // NOTE: the task-major kernels above compute this stride with a
+    // hardcoded QK_K; that is only correct for the K-quant block types
+    // they are instantiated with. `qk` is used here -- identical for
+    // every K-quant, correct for Q8_0 too.
+    const size_t weight_block_size = sizeof(block_q_t);
+    const size_t input_block_size = sizeof(block_q8_1);
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
+
+    const block_q_t * w =
+        (const block_q_t *)((const char *)all_weights + (size_t)expert_id * weight_expert_stride_bytes);
+
+    const int blocks_per_row_x = k / qk;
+    constexpr int blocks_per_iter = vdr * WARP_SIZE / qi; // one warp's coverage
+
+    for (int t0 = 0; t0 < count; t0 += MOE_GROUPED_TASK_TILE) {
+        const int tile = (count - t0) < MOE_GROUPED_TASK_TILE ? (count - t0) : MOE_GROUPED_TASK_TILE;
+        float tmp[MOE_GROUPED_TASK_TILE];
+#pragma unroll
+        for (int i = 0; i < MOE_GROUPED_TASK_TILE; ++i) {
+            tmp[i] = 0.0f;
+        }
+        // Stage the tile's input base pointers once.
+        const block_q8_1 * xs[MOE_GROUPED_TASK_TILE];
+#pragma unroll
+        for (int i = 0; i < MOE_GROUPED_TASK_TILE; ++i) {
+            if (i < tile) {
+                const int t = (int)task_list[t0 + i];
+                const int input_idx = (input_dim1 == 1) ? (t / topk) : t;
+                xs[i] = (const block_q8_1 *)((const char *)all_inputs
+                    + (size_t)input_idx * input_task_stride_bytes);
+            }
+        }
+        for (int kbx = (int)threadIdx.x / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk / QK8_1);
+            const int kqs = vdr * ((int)threadIdx.x % (qi / vdr));
+            const block_q_t * wb = &w[kbx + row * blocks_per_row_x];
+#pragma unroll
+            for (int i = 0; i < MOE_GROUPED_TASK_TILE; ++i) {
+                if (i < tile) {
+                    tmp[i] += vec_dot_q_cuda(wb, &xs[i][kby], kqs);
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < MOE_GROUPED_TASK_TILE; ++i) {
+            if (i < tile) {
+                float v = warp_reduce_sum(tmp[i]);
+                if (threadIdx.x == 0) {
+                    const int t = (int)task_list[t0 + i];
+                    all_outputs[(size_t)t * n + row] = v;
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void indexed_moe_forward_q4k_q8_1_grp(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_grouped<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q5k_q8_1_grp(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_grouped<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q6k_q8_1_grp(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_grouped<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+// TILED MMQ indexed-MoE kernels (rainfall-one, 2026-08-30, round 3 --
+// the grouped-GEMM shape that rounds 1/2 could not reach with per-task
+// vec_dot calls). Reuses the proven mul_mat_q tile machinery above
+// (allocate_tiles/load_tiles/vec_dot_*_mul_mat): each block unpacks a
+// weight tile into SHARED MEMORY ONCE and reuses it across a column
+// tile of tasks, with activations staged in shared memory too -- the
+// per-task unpack and per-task global loads that floored the vec_dot
+// kernels at ~1ms/launch disappear.
+//
+// Shape choices vs the dense mul_mat_q entry points:
+// - grid = (row_tiles, col_tile_stride, num_experts): blockIdx.z picks
+//   the expert; each block scans the (batch*topk) index list into
+//   shared memory and EXITS before touching any weight when no task
+//   routed here.
+// - mmq_x is small (8): per-expert task counts average tasks/experts
+//   (~8 at 128 slots x topk 8 over 128 experts), so wide column tiles
+//   would burn dp4a lanes on clamped duplicates.
+// - Column tiles are GRID-STRIDE (col_tile += gridDim.y): identical
+//   prompts can route MANY tasks to one expert, and a fixed grid.y
+//   cannot know the per-expert maximum host-side (the index tensor is
+//   device-resident, capture forbids a sync) -- hot experts loop, which
+//   degrades their latency but never drops a task.
+// - dst indexing: the dense template's dst[col*nrows_dst + row] IS
+//   all_outputs[task*n + row] once columns map through the task list.
+template <int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
+              allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
+static __device__ __forceinline__ void indexed_mul_mat_q_moe(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,          // output rows per expert (nrows_x)
+    const int k,          // input width (ncols_x)
+    const int batch,
+    const int topk,
+    const int k_padded,   // nrows_y
+    const int input_dim1) {
+
+#define IMMQ_MAX_TASKS 1024
+    const unsigned int expert_id = blockIdx.z;
+    const int total_tasks = batch * topk;
+
+    __shared__ unsigned short task_list[IMMQ_MAX_TASKS];
+    __shared__ int task_count;
+    const int tid_flat = (int)threadIdx.y * WARP_SIZE + (int)threadIdx.x;
+    if (tid_flat == 0) {
+        task_count = 0;
+    }
+    __syncthreads();
+    for (int t = tid_flat; t < total_tasks; t += (int)(blockDim.x * blockDim.y)) {
+        if (indices[t] == expert_id) {
+            const int slot = atomicAdd(&task_count, 1);
+            if (slot < IMMQ_MAX_TASKS) {
+                task_list[slot] = (unsigned short)t;
+            }
+        }
+    }
+    __syncthreads();
+    const int count = task_count < IMMQ_MAX_TASKS ? task_count : IMMQ_MAX_TASKS;
+    if (count == 0) {
+        return;
+    }
+
+    // CANONICALIZE the list order (2026-08-30 race, found live): the
+    // atomicAdd append order above is nondeterministic PER BLOCK, and
+    // every block covering a different row tile of this expert must
+    // agree which task sits at which column -- otherwise two blocks
+    // partition the columns of two DIFFERENT permutations, covering
+    // some tasks twice and others never (observed as one row-tile of
+    // one task left unwritten, moving between runs). Odd-even
+    // transposition sort by task id: `count` phases, all threads
+    // comparing disjoint pairs; typical per-expert counts are tiny.
+    for (int phase = 0; phase < count; ++phase) {
+        const int start = phase & 1;
+        for (int p = start + 2 * tid_flat; p + 1 < count; p += 2 * (int)(blockDim.x * blockDim.y)) {
+            const unsigned short a = task_list[p];
+            const unsigned short b = task_list[p + 1];
+            if (a > b) {
+                task_list[p] = b;
+                task_list[p + 1] = a;
+            }
+        }
+        __syncthreads();
+    }
+
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * sizeof(block_q_t);
+    const block_q_t  * x = (const block_q_t  *)((const char *)all_weights
+        + (size_t)expert_id * weight_expert_stride_bytes);
+    const block_q8_1 * y = (const block_q8_1 *) all_inputs;
+
+    const int blocks_per_row_x = k / qk;
+    const int blocks_per_col_y = k_padded / QK8_1;
+    const int blocks_per_warp = WARP_SIZE / qi;
+
+    const int row_dst_0 = blockIdx.x * mmq_y;
+    const int & row_x_0 = row_dst_0;
+    if (row_dst_0 >= n) {
+        return;
+    }
+
+    int   * tile_x_ql = nullptr;
+    half2 * tile_x_dm = nullptr;
+    int   * tile_x_qh = nullptr;
+    int   * tile_x_sc = nullptr;
+    allocate_tiles(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc);
+
+    __shared__ int    tile_y_qs[mmq_x * WARP_SIZE];
+    __shared__ half2  tile_y_ds[mmq_x * WARP_SIZE / QI8_1];
+
+#ifdef IMMQ_DEBUG
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 3 && blockIdx.y == 1 && blockIdx.z == 2) {
+        printf("dbg(3,1,2): count=%d row_dst_0=%d n=%d gridDim.y=%d\n", count, row_dst_0, n, gridDim.y);
+    }
+#endif
+    // Grid-stride over column (task) tiles -- see the header comment.
+    for (int col_tile = blockIdx.y; col_tile * mmq_x < count; col_tile += gridDim.y) {
+        const int col_dst_0 = col_tile * mmq_x;
+#ifdef IMMQ_DEBUG
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 3 && blockIdx.y == 1 && blockIdx.z == 2) {
+            printf("dbg(3,1,2): col_tile=%d entering k loop\n", col_tile);
+        }
+#endif
+
+        float sum[mmq_y / WARP_SIZE][mmq_x / nwarps] = {{0.0f}};
+
+        for (int ib0 = 0; ib0 < blocks_per_row_x; ib0 += blocks_per_warp) {
+
+            load_tiles(x + row_x_0 * blocks_per_row_x + ib0, tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc,
+                       threadIdx.y, n - row_x_0 - 1, threadIdx.x, blocks_per_row_x);
+
+#pragma unroll
+            for (int ir = 0; ir < qr; ++ir) {
+                const int kqs = ir * WARP_SIZE + threadIdx.x;
+                const int kbxd = kqs / QI8_1;
+
+#pragma unroll
+                for (int i = 0; i < mmq_x; i += nwarps) {
+                    const int col_local = min(col_dst_0 + (int)threadIdx.y + i, count - 1);
+                    const int t = (int)task_list[col_local];
+                    const int input_row = (input_dim1 == 1) ? (t / topk) : t;
+
+                    const block_q8_1 * by0 = &y[(size_t)input_row * blocks_per_col_y + ib0 * (qk / QK8_1) + kbxd];
+                    const int index_y = ((int)threadIdx.y + i) * WARP_SIZE + kqs % WARP_SIZE;
+                    tile_y_qs[index_y] = get_int_from_int8_aligned(by0->qs, threadIdx.x % QI8_1);
+                }
+
+#pragma unroll
+                for (int ids0 = 0; ids0 < mmq_x; ids0 += nwarps * QI8_1) {
+                    const int ids = (ids0 + (int)threadIdx.y * QI8_1 + (int)threadIdx.x / (WARP_SIZE / QI8_1)) % mmq_x;
+                    const int kby = (int)threadIdx.x % (WARP_SIZE / QI8_1);
+                    const int col_local = min(col_dst_0 + ids, count - 1);
+                    const int t = (int)task_list[col_local];
+                    const int input_row = (input_dim1 == 1) ? (t / topk) : t;
+
+                    const half2 * dsi_src =
+                        &y[(size_t)input_row * blocks_per_col_y + ib0 * (qk / QK8_1) + ir * (WARP_SIZE / QI8_1) + kby].ds;
+                    half2 * dsi_dst = &tile_y_ds[ids * (WARP_SIZE / QI8_1) + kby];
+                    if (need_sum) {
+                        *dsi_dst = *dsi_src;
+                    } else {
+                        float * dfi_dst = (float *) dsi_dst;
+                        *dfi_dst = __low2half(*dsi_src);
+                    }
+                }
+
+                __syncthreads();
+
+                for (int kk = ir * WARP_SIZE / qr; kk < (ir + 1) * WARP_SIZE / qr; kk += vdr) {
+#pragma unroll
+                    for (int j = 0; j < mmq_x; j += nwarps) {
+#pragma unroll
+                        for (int i = 0; i < mmq_y; i += WARP_SIZE) {
+                            sum[i / WARP_SIZE][j / nwarps] += vec_dot(
+                                tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc, tile_y_qs, tile_y_ds,
+                                (int)threadIdx.x + i, (int)threadIdx.y + j, kk);
+                        }
+                    }
+                }
+
+                __syncthreads();
+            }
+        }
+
+#ifdef IMMQ_DEBUG
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 3 && blockIdx.y == 1 && blockIdx.z == 2) {
+            printf("dbg(3,1,2): col_tile=%d reached write tail, sum00=%g\n", col_tile, sum[0][0]);
+        }
+#endif
+#pragma unroll
+        for (int j = 0; j < mmq_x; j += nwarps) {
+            const int col_local = col_dst_0 + j + (int)threadIdx.y;
+            if (col_local >= count) {
+                continue;
+            }
+            const int t = (int)task_list[col_local];
+
+#pragma unroll
+            for (int i = 0; i < mmq_y; i += WARP_SIZE) {
+                const int row_dst = row_dst_0 + (int)threadIdx.x + i;
+                if (row_dst >= n) {
+                    continue;
+                }
+                all_outputs[(size_t)t * n + row_dst] = sum[i / WARP_SIZE][j / nwarps];
+            }
+        }
+        __syncthreads();
+    }
+#undef IMMQ_MAX_TASKS
+}
+
+#define IMMQ_X 8
+#define IMMQ_Y 64
+#define IMMQ_NWARPS 8
+
+// Measured geometry on the A100-40GB (2026-08-30, N=128 sweeps):
+// (8, 32, 4) beats (8, 64, 8) for BOTH hot dtypes -- smaller row tiles
+// mean more blocks across the ~110 active experts, which the SM
+// scheduler balances better than fewer fatter blocks (994 vs 954
+// tok/s aggregate on Q4K). This is a PER-DEVICE truth, not a law:
+// both geometries stay compiled (the _y64 twins below) and the Rust
+// wrapper selects at runtime (CEREBRA_MMQ_GEOM), so a different card
+// (H200, ...) is a re-measure, not a rebuild.
+#define IMMQ4_Y 32
+#define IMMQ4_NWARPS 4
+
+extern "C" __global__ void indexed_mul_mat_q4_K_moe(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_mul_mat_q_moe<QK_K, QR4_K, QI4_K, true, block_q4_K, IMMQ_X, IMMQ4_Y, IMMQ4_NWARPS,
+        allocate_tiles_q4_K<IMMQ4_Y>, load_tiles_q4_K<IMMQ4_Y, IMMQ4_NWARPS, true>,
+        VDR_Q4_K_Q8_1_MMQ, vec_dot_q4_K_q8_1_mul_mat>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_mul_mat_q5_K_moe(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_mul_mat_q_moe<QK_K, QR5_K, QI5_K, true, block_q5_K, IMMQ_X, IMMQ4_Y, IMMQ4_NWARPS,
+        allocate_tiles_q5_K<IMMQ4_Y>, load_tiles_q5_K<IMMQ4_Y, IMMQ4_NWARPS, true>,
+        VDR_Q5_K_Q8_1_MMQ, vec_dot_q5_K_q8_1_mul_mat>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+// The (8, 64, 8) geometry twins -- runtime-selectable for devices
+// where fatter row tiles win (see the geometry note above).
+extern "C" __global__ void indexed_mul_mat_q4_K_moe_y64(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_mul_mat_q_moe<QK_K, QR4_K, QI4_K, true, block_q4_K, IMMQ_X, IMMQ_Y, IMMQ_NWARPS,
+        allocate_tiles_q4_K<IMMQ_Y>, load_tiles_q4_K<IMMQ_Y, IMMQ_NWARPS, true>,
+        VDR_Q4_K_Q8_1_MMQ, vec_dot_q4_K_q8_1_mul_mat>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_mul_mat_q5_K_moe_y64(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_mul_mat_q_moe<QK_K, QR5_K, QI5_K, true, block_q5_K, IMMQ_X, IMMQ_Y, IMMQ_NWARPS,
+        allocate_tiles_q5_K<IMMQ_Y>, load_tiles_q5_K<IMMQ_Y, IMMQ_NWARPS, true>,
+        VDR_Q5_K_Q8_1_MMQ, vec_dot_q5_K_q8_1_mul_mat>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+// WEIGHT-HOISTED grouped kernels (rainfall-one, 2026-08-30, round 2).
+// Profiling the template grouped kernels at 1024 tasks showed them at
+// ~1ms/launch against a 150us HBM floor and a ~300us dp4a floor: the
+// bottleneck is the per-call vec_dot WEIGHT-side work (quant loads +
+// the scale/min bit-unpacking), re-executed once per (task, row,
+// chunk) even though it is task-INDEPENDENT. These type-specialized
+// variants hoist that weight-side work out of the task loop -- computed
+// once per (row, chunk), reused across the whole task tile -- while the
+// task loop keeps exactly the activation loads + impl_vmmq arithmetic,
+// so outputs stay bit-identical to the template kernels (same impl
+// function, same inputs, same k-order per task).
+extern "C" __global__ void indexed_moe_forward_q4k_q8_1_grph(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+
+    const unsigned int expert_id = blockIdx.y;
+    const int total_tasks = batch * topk;
+
+    __shared__ unsigned short task_list[MOE_GROUPED_MAX_TASKS];
+    __shared__ int task_count;
+    const int tid_flat = (int)threadIdx.y * WARP_SIZE + (int)threadIdx.x;
+    if (tid_flat == 0) {
+        task_count = 0;
+    }
+    __syncthreads();
+    for (int t = tid_flat; t < total_tasks; t += (int)(blockDim.x * blockDim.y)) {
+        if (indices[t] == expert_id) {
+            const int slot = atomicAdd(&task_count, 1);
+            if (slot < MOE_GROUPED_MAX_TASKS) {
+                task_list[slot] = (unsigned short)t;
+            }
+        }
+    }
+    __syncthreads();
+    const int count = task_count < MOE_GROUPED_MAX_TASKS ? task_count : MOE_GROUPED_MAX_TASKS;
+    if (count == 0) {
+        return;
+    }
+
+    constexpr int rows_per_block = 4;
+    const int row = rows_per_block * blockIdx.x + (int)threadIdx.y;
+    if (row >= n) {
+        return;
+    }
+
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / QK_K * sizeof(block_q4_K);
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const block_q4_K * w =
+        (const block_q4_K *)((const char *)all_weights + (size_t)expert_id * weight_expert_stride_bytes);
+
+    const int blocks_per_row_x = k / QK_K;
+    constexpr int blocks_per_iter = VDR_Q4_K_Q8_1_MMVQ * WARP_SIZE / QI4_K;
+    const int iqs = VDR_Q4_K_Q8_1_MMVQ * ((int)threadIdx.x % (QI4_K / VDR_Q4_K_Q8_1_MMVQ));
+
+    for (int t0 = 0; t0 < count; t0 += MOE_GROUPED_TASK_TILE) {
+        const int tile = (count - t0) < MOE_GROUPED_TASK_TILE ? (count - t0) : MOE_GROUPED_TASK_TILE;
+        float tmp[MOE_GROUPED_TASK_TILE];
+        const block_q8_1 * xs[MOE_GROUPED_TASK_TILE];
+#pragma unroll
+        for (int i = 0; i < MOE_GROUPED_TASK_TILE; ++i) {
+            tmp[i] = 0.0f;
+            if (i < tile) {
+                const int t = (int)task_list[t0 + i];
+                const int input_idx = (input_dim1 == 1) ? (t / topk) : t;
+                xs[i] = (const block_q8_1 *)((const char *)all_inputs
+                    + (size_t)input_idx * input_task_stride_bytes);
+            }
+        }
+        for (int kbx = (int)threadIdx.x / (QI4_K / VDR_Q4_K_Q8_1_MMVQ); kbx < blocks_per_row_x;
+             kbx += blocks_per_iter) {
+            const int kby = kbx * (QK_K / QK8_1);
+            const block_q4_K * bq4_K = &w[kbx + row * blocks_per_row_x];
+
+            // --- weight-side hoist: identical to vec_dot_q4_K_q8_1's
+            // preamble, computed ONCE per (row, chunk) ---
+            const int bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+            const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+            int v[2];
+            v[0] = q4[0];
+            v[1] = q4[4];
+            const uint16_t * scales = (const uint16_t *)bq4_K->scales;
+            uint16_t aux[2];
+            const int j = bq8_offset / 2;
+            if (j < 2) {
+                aux[0] = scales[j + 0] & 0x3f3f;
+                aux[1] = scales[j + 2] & 0x3f3f;
+            } else {
+                aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+                aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+            }
+            const uint8_t * sc = (const uint8_t *)aux;
+            const uint8_t * m = sc + 2;
+            const half2 dm = bq4_K->dm;
+
+            // --- task loop: activation loads + impl arithmetic only ---
+#pragma unroll
+            for (int i = 0; i < MOE_GROUPED_TASK_TILE; ++i) {
+                if (i < tile) {
+                    const block_q8_1 * bq8_base = &xs[i][kby];
+                    int u[2 * QR4_K];
+                    float d8[QR4_K];
+#pragma unroll
+                    for (int r = 0; r < QR4_K; ++r) {
+                        const block_q8_1 * bq8i = bq8_base + bq8_offset + r;
+                        d8[r] = __low2float(bq8i->ds);
+                        const int * q8 = (const int *)bq8i->qs + ((iqs / 2) % 4);
+                        u[2 * r + 0] = q8[0];
+                        u[2 * r + 1] = q8[4];
+                    }
+                    tmp[i] += vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, dm, d8);
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < MOE_GROUPED_TASK_TILE; ++i) {
+            if (i < tile) {
+                float val = warp_reduce_sum(tmp[i]);
+                if (threadIdx.x == 0) {
+                    const int t = (int)task_list[t0 + i];
+                    all_outputs[(size_t)t * n + row] = val;
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void indexed_moe_forward_q5k_q8_1_grph(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+
+    const unsigned int expert_id = blockIdx.y;
+    const int total_tasks = batch * topk;
+
+    __shared__ unsigned short task_list[MOE_GROUPED_MAX_TASKS];
+    __shared__ int task_count;
+    const int tid_flat = (int)threadIdx.y * WARP_SIZE + (int)threadIdx.x;
+    if (tid_flat == 0) {
+        task_count = 0;
+    }
+    __syncthreads();
+    for (int t = tid_flat; t < total_tasks; t += (int)(blockDim.x * blockDim.y)) {
+        if (indices[t] == expert_id) {
+            const int slot = atomicAdd(&task_count, 1);
+            if (slot < MOE_GROUPED_MAX_TASKS) {
+                task_list[slot] = (unsigned short)t;
+            }
+        }
+    }
+    __syncthreads();
+    const int count = task_count < MOE_GROUPED_MAX_TASKS ? task_count : MOE_GROUPED_MAX_TASKS;
+    if (count == 0) {
+        return;
+    }
+
+    constexpr int rows_per_block = 4;
+    const int row = rows_per_block * blockIdx.x + (int)threadIdx.y;
+    if (row >= n) {
+        return;
+    }
+
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / QK_K * sizeof(block_q5_K);
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const block_q5_K * w =
+        (const block_q5_K *)((const char *)all_weights + (size_t)expert_id * weight_expert_stride_bytes);
+
+    const int blocks_per_row_x = k / QK_K;
+    constexpr int blocks_per_iter = VDR_Q5_K_Q8_1_MMVQ * WARP_SIZE / QI5_K;
+    const int iqs = VDR_Q5_K_Q8_1_MMVQ * ((int)threadIdx.x % (QI5_K / VDR_Q5_K_Q8_1_MMVQ));
+
+    for (int t0 = 0; t0 < count; t0 += MOE_GROUPED_TASK_TILE) {
+        const int tile = (count - t0) < MOE_GROUPED_TASK_TILE ? (count - t0) : MOE_GROUPED_TASK_TILE;
+        float tmp[MOE_GROUPED_TASK_TILE];
+        const block_q8_1 * xs[MOE_GROUPED_TASK_TILE];
+#pragma unroll
+        for (int i = 0; i < MOE_GROUPED_TASK_TILE; ++i) {
+            tmp[i] = 0.0f;
+            if (i < tile) {
+                const int t = (int)task_list[t0 + i];
+                const int input_idx = (input_dim1 == 1) ? (t / topk) : t;
+                xs[i] = (const block_q8_1 *)((const char *)all_inputs
+                    + (size_t)input_idx * input_task_stride_bytes);
+            }
+        }
+        for (int kbx = (int)threadIdx.x / (QI5_K / VDR_Q5_K_Q8_1_MMVQ); kbx < blocks_per_row_x;
+             kbx += blocks_per_iter) {
+            const int kby = kbx * (QK_K / QK8_1);
+            const block_q5_K * bq5_K = &w[kbx + row * blocks_per_row_x];
+
+            // --- weight-side hoist: identical to vec_dot_q5_K_q8_1's
+            // preamble, computed ONCE per (row, chunk) ---
+            const int bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+            const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+            const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs / 2) % 4));
+            int vl[2];
+            int vh[2];
+            vl[0] = ql[0];
+            vl[1] = ql[4];
+            vh[0] = qh[0] >> bq8_offset;
+            vh[1] = qh[4] >> bq8_offset;
+            const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+            uint16_t aux[2];
+            const int j = bq8_offset / 2;
+            if (j < 2) {
+                aux[0] = scales[j + 0] & 0x3f3f;
+                aux[1] = scales[j + 2] & 0x3f3f;
+            } else {
+                aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+                aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+            }
+            const uint8_t * sc = (const uint8_t *)aux;
+            const uint8_t * m = sc + 2;
+            const half2 dm = bq5_K->dm;
+
+            // --- task loop: activation loads + impl arithmetic only ---
+#pragma unroll
+            for (int i = 0; i < MOE_GROUPED_TASK_TILE; ++i) {
+                if (i < tile) {
+                    const block_q8_1 * bq8_base = &xs[i][kby];
+                    int u[2 * QR5_K];
+                    float d8[QR5_K];
+#pragma unroll
+                    for (int r = 0; r < QR5_K; ++r) {
+                        const block_q8_1 * bq8i = bq8_base + bq8_offset + r;
+                        d8[r] = __low2float(bq8i->ds);
+                        const int * q8 = (const int *)bq8i->qs + ((iqs / 2) % 4);
+                        u[2 * r + 0] = q8[0];
+                        u[2 * r + 1] = q8[4];
+                    }
+                    tmp[i] += vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, dm, d8);
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < MOE_GROUPED_TASK_TILE; ++i) {
+            if (i < tile) {
+                float val = warp_reduce_sum(tmp[i]);
+                if (threadIdx.x == 0) {
+                    const int t = (int)task_list[t0 + i];
+                    all_outputs[(size_t)t * n + row] = val;
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void indexed_moe_forward_q8_0_q8_1_grp(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_grouped<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
 }

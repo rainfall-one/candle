@@ -520,7 +520,7 @@ fn indexed_moe_forward_fused_q8_1_input(
     idx_shape: &crate::Shape, //[batch, topk]
     dev: &CudaDevice,
 ) -> Result<(CudaStorage, crate::Shape)> {
-    let (_, n, k) = w_shape.dims3()?;
+    let (num_experts, n, k) = w_shape.dims3()?;
     let batch = in_shape.dims()[0];
     let input_dim1 = in_shape.dims()[1];
 
@@ -594,22 +594,93 @@ fn indexed_moe_forward_fused_q8_1_input(
     // (grid.x = ceil(n / 4), no shared-memory reduction). Only wired
     // for the dtypes that real down projections use.
     let small_k = k / 256 <= 4;
-    let (kernel_name, warp_rows) = match w_dtype {
-        GgmlDType::Q2K => ("indexed_moe_forward_q2k_q8_1", false),
-        GgmlDType::Q3K => ("indexed_moe_forward_q3k_q8_1", false),
-        // Q4K experiment (2026-08-29): also try warp-rows for the k=2048
-        // gate/up shape (8 k-blocks -> each warp runs 4 serial
-        // iterations, but drops the cross-warp barrier and quarters the
-        // block count). Measured on the consuming workload; revert to
-        // `false` if it does not hold its gain.
-        GgmlDType::Q4K if k / 256 <= 8 => ("indexed_moe_forward_q4k_q8_1_wr", true),
-        GgmlDType::Q4K => ("indexed_moe_forward_q4k_q8_1", false),
-        GgmlDType::Q5K if small_k => ("indexed_moe_forward_q5k_q8_1_wr", true),
-        GgmlDType::Q5K => ("indexed_moe_forward_q5k_q8_1", false),
-        GgmlDType::Q6K if small_k => ("indexed_moe_forward_q6k_q8_1_wr", true),
-        GgmlDType::Q6K => ("indexed_moe_forward_q6k_q8_1", false),
-        GgmlDType::Q8_0 => ("indexed_moe_forward_q8_0_q8_1", false),
-        _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
+    // EXPERT-GROUPED dispatch (rainfall-one, 2026-08-30): at large task
+    // counts (continuous batching -- batch up to 32, topk 8) the
+    // task-major kernels read each selected expert's weights once per
+    // TASK, so tasks sharing an expert multiply HBM weight traffic. The
+    // `_grp` kernels are expert-major (grid.y = expert): weights are
+    // read once per ACTIVE expert, outputs bit-identical (per-task
+    // accumulation order unchanged). Threshold: past ~4x the expert
+    // count in tasks the reuse is guaranteed; below it the task-major
+    // shapes keep their smaller grids. The grouped kernel's shared task
+    // list caps at 256 tasks.
+    // MEASURED NULL (2026-08-30, A100, 35B MoE, continuous batching):
+    // grouped was SLOWER at every batch width (N=8 380->291, N=32
+    // 529->483 tok/s aggregate) -- the task-major grid already gets
+    // enough L2 weight reuse that the grouped kernel's serialized
+    // per-task vec_dots cost more than the HBM reads they save. Kept
+    // behind CEREBRA_MOE_GROUPED=1 for future tuning; default off.
+    let total_tasks = batch * topk;
+    let grouped = !std::env::var("CEREBRA_MOE_GROUPED").unwrap_or_default().is_empty()
+        && total_tasks > 32
+        && total_tasks <= 1024
+        && matches!(
+            w_dtype,
+            GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K | GgmlDType::Q8_0
+        );
+    // Tiled MMQ for the hot expert dtypes (round 3, see the kernel's
+    // header comment): weight tiles unpacked to shared memory once per
+    // block and reused across a task-column tile -- the shape the
+    // per-task vec_dot kernels (rounds 1/2, kept below for Q6K/Q8_0)
+    // could not reach. Grid: (row_tiles, col_tile_stride, experts),
+    // block (32, IMMQ_NWARPS).
+    // Bisect switch: CEREBRA_MOE_GROUPED=1 -> MMQ for both hot dtypes;
+    // =q4k / =q5k -> MMQ for that dtype only (the other stays
+    // task-major) -- correctness bisection for the tiled path.
+    let moe_grouped_env = std::env::var("CEREBRA_MOE_GROUPED").unwrap_or_default();
+    let mmq_moe = grouped
+        && match w_dtype {
+            GgmlDType::Q4K => moe_grouped_env == "1" || moe_grouped_env == "q4k",
+            GgmlDType::Q5K => moe_grouped_env == "1" || moe_grouped_env == "q5k",
+            _ => false,
+        };
+    // The round-1/2 expert-major vec_dot kernels, kept for Q6K/Q8_0
+    // when everything is grouped ("1"); dtype-bisect values leave the
+    // non-selected dtypes on the task-major kernels entirely.
+    let grp_family = grouped
+        && !mmq_moe
+        && moe_grouped_env == "1"
+        && matches!(w_dtype, GgmlDType::Q6K | GgmlDType::Q8_0);
+    // Per-device geometry (never hardcode for one card): both compiled
+    // tile shapes are runtime-selectable. CEREBRA_MMQ_GEOM=y64 picks
+    // the fatter (8, 64, 8) row tiles; the default y32 (8, 32, 4) is
+    // the A100-40GB-measured best. A new device class (H200, ...) is a
+    // re-measure of this env, not a kernel rebuild.
+    let mmq_y64 = std::env::var("CEREBRA_MMQ_GEOM").as_deref() == Ok("y64");
+    let (kernel_name, warp_rows) = if mmq_moe {
+        let name = match (w_dtype, mmq_y64) {
+            (GgmlDType::Q4K, false) => "indexed_mul_mat_q4_K_moe",
+            (GgmlDType::Q5K, false) => "indexed_mul_mat_q5_K_moe",
+            (GgmlDType::Q4K, true) => "indexed_mul_mat_q4_K_moe_y64",
+            (GgmlDType::Q5K, true) => "indexed_mul_mat_q5_K_moe_y64",
+            _ => unreachable!("mmq gate above"),
+        };
+        (name, false)
+    } else if grp_family {
+        let name = match w_dtype {
+            GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1_grp",
+            GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1_grp",
+            _ => unreachable!("grp_family gate above"),
+        };
+        (name, true)
+    } else {
+        match w_dtype {
+            GgmlDType::Q2K => ("indexed_moe_forward_q2k_q8_1", false),
+            GgmlDType::Q3K => ("indexed_moe_forward_q3k_q8_1", false),
+            // Q4K experiment (2026-08-29): also try warp-rows for the k=2048
+            // gate/up shape (8 k-blocks -> each warp runs 4 serial
+            // iterations, but drops the cross-warp barrier and quarters the
+            // block count). Measured on the consuming workload; revert to
+            // `false` if it does not hold its gain.
+            GgmlDType::Q4K if k / 256 <= 8 => ("indexed_moe_forward_q4k_q8_1_wr", true),
+            GgmlDType::Q4K => ("indexed_moe_forward_q4k_q8_1", false),
+            GgmlDType::Q5K if small_k => ("indexed_moe_forward_q5k_q8_1_wr", true),
+            GgmlDType::Q5K => ("indexed_moe_forward_q5k_q8_1", false),
+            GgmlDType::Q6K if small_k => ("indexed_moe_forward_q6k_q8_1_wr", true),
+            GgmlDType::Q6K => ("indexed_moe_forward_q6k_q8_1", false),
+            GgmlDType::Q8_0 => ("indexed_moe_forward_q8_0_q8_1", false),
+            _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
+        }
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
     let (nblocks, nwarps) = if warp_rows {
@@ -617,10 +688,37 @@ fn indexed_moe_forward_fused_q8_1_input(
     } else {
         (n as u32, 4)
     };
-    let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (nblocks, batch as u32, topk as u32),
-        block_dim: (WARP_SIZE as u32, nwarps, 1),
-        shared_mem_bytes: 0,
+    let cfg = if mmq_moe {
+        // Geometry must mirror the kernel's IMMQ constants: Q4K runs
+        // (mmq_y 32, nwarps 4), Q5K (mmq_y 64, nwarps 8). grid.y = 8
+        // column-tile strides (hot experts loop in-kernel, see the
+        // kernel's grid-stride comment).
+        // Geometry mirrors the selected kernel's IMMQ constants; the
+        // column-tile stride is env-tunable per device too
+        // (CEREBRA_MMQ_COL_STRIDE, default 8 -- A100-measured).
+        let (mmq_y, nwarps_mmq) = if mmq_y64 { (64u32, 8u32) } else { (32u32, 4u32) };
+        let col_stride: u32 = std::env::var("CEREBRA_MMQ_COL_STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| (1..=256).contains(v))
+            .unwrap_or(8);
+        cudarc::driver::LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(mmq_y), col_stride, num_experts as u32),
+            block_dim: (WARP_SIZE as u32, nwarps_mmq, 1),
+            shared_mem_bytes: 0,
+        }
+    } else if grp_family {
+        cudarc::driver::LaunchConfig {
+            grid_dim: (nblocks, num_experts as u32, 1),
+            block_dim: (WARP_SIZE as u32, nwarps, 1),
+            shared_mem_bytes: 0,
+        }
+    } else {
+        cudarc::driver::LaunchConfig {
+            grid_dim: (nblocks, batch as u32, topk as u32),
+            block_dim: (WARP_SIZE as u32, nwarps, 1),
+            shared_mem_bytes: 0,
+        }
     };
 
     let mut builder = func.builder();
