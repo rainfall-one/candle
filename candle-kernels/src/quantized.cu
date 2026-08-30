@@ -5124,6 +5124,29 @@ extern "C" __global__ void indexed_mul_mat_q5_K_moe(
 
 // The (8, 64, 8) geometry twins -- runtime-selectable for devices
 // where fatter row tiles win (see the geometry note above).
+// Q6K (down-projection weights) through MMQ -- Step 2 of the Goal-2500
+// campaign (2026-08-30): the task-major indexed_moe_forward_q6k_q8_1_grp
+// fallback measured ~5.0% of GPU time in the Step 0 profile, larger than
+// first estimated. need_sum=false and block_q6_K match the dense
+// mul_mat_q6_K entry point above exactly (Q6K carries no additive sum
+// term, unlike Q4K/Q5K).
+extern "C" __global__ void indexed_mul_mat_q6_K_moe(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_mul_mat_q_moe<QK_K, QR6_K, QI6_K, false, block_q6_K, IMMQ_X, IMMQ4_Y, IMMQ4_NWARPS,
+        allocate_tiles_q6_K<IMMQ4_Y>, load_tiles_q6_K<IMMQ4_Y, IMMQ4_NWARPS, true>,
+        VDR_Q6_K_Q8_1_MMQ, vec_dot_q6_K_q8_1_mul_mat>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
 extern "C" __global__ void indexed_mul_mat_q4_K_moe_y64(
     const void * __restrict__ all_weights,
     const void * __restrict__ all_inputs,

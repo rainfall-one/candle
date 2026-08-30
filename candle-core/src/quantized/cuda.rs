@@ -632,15 +632,19 @@ fn indexed_moe_forward_fused_q8_1_input(
         && match w_dtype {
             GgmlDType::Q4K => moe_grouped_env == "1" || moe_grouped_env == "q4k",
             GgmlDType::Q5K => moe_grouped_env == "1" || moe_grouped_env == "q5k",
+            // Step 2 of the Goal-2500 campaign (2026-08-30): Q6K down
+            // projections through the same tiled MMQ path. "q6k" bisects
+            // independently of Q4K/Q5K for correctness isolation.
+            GgmlDType::Q6K => moe_grouped_env == "1" || moe_grouped_env == "q6k",
             _ => false,
         };
-    // The round-1/2 expert-major vec_dot kernels, kept for Q6K/Q8_0
-    // when everything is grouped ("1"); dtype-bisect values leave the
+    // The round-1/2 expert-major vec_dot kernel, kept for Q8_0 when
+    // everything is grouped ("1"); dtype-bisect values leave
     // non-selected dtypes on the task-major kernels entirely.
     let grp_family = grouped
         && !mmq_moe
         && moe_grouped_env == "1"
-        && matches!(w_dtype, GgmlDType::Q6K | GgmlDType::Q8_0);
+        && matches!(w_dtype, GgmlDType::Q8_0);
     // Per-device geometry (never hardcode for one card): both compiled
     // tile shapes are runtime-selectable. CEREBRA_MMQ_GEOM=y64 picks
     // the fatter (8, 64, 8) row tiles; the default y32 (8, 32, 4) is
@@ -653,12 +657,15 @@ fn indexed_moe_forward_fused_q8_1_input(
             (GgmlDType::Q5K, false) => "indexed_mul_mat_q5_K_moe",
             (GgmlDType::Q4K, true) => "indexed_mul_mat_q4_K_moe_y64",
             (GgmlDType::Q5K, true) => "indexed_mul_mat_q5_K_moe_y64",
+            // No y64 twin compiled for Q6K (Step 2 shipped only the
+            // A100-measured y32 geometry) -- CEREBRA_MMQ_GEOM=y64 is a
+            // no-op for this dtype until a twin is added and measured.
+            (GgmlDType::Q6K, _) => "indexed_mul_mat_q6_K_moe",
             _ => unreachable!("mmq gate above"),
         };
         (name, false)
     } else if grp_family {
         let name = match w_dtype {
-            GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1_grp",
             GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1_grp",
             _ => unreachable!("grp_family gate above"),
         };
@@ -695,13 +702,20 @@ fn indexed_moe_forward_fused_q8_1_input(
         // kernel's grid-stride comment).
         // Geometry mirrors the selected kernel's IMMQ constants; the
         // column-tile stride is env-tunable per device too
-        // (CEREBRA_MMQ_COL_STRIDE, default 8 -- A100-measured).
-        let (mmq_y, nwarps_mmq) = if mmq_y64 { (64u32, 8u32) } else { (32u32, 4u32) };
+        // (CEREBRA_MMQ_COL_STRIDE, default 2 -- A100-measured, Step 1
+        // autotune of the Goal-2500 campaign: 1049.1 -> 1219.5 tok/s
+        // aggregate at N=128, +16.2%, confirmed stable across repeat
+        // sweeps and non-monotonic across {1,2,4,8,16}).
+        // Q6K has no y64 twin compiled (see kernel_name match above) --
+        // its grid geometry must stay y32 regardless of the env flag, or
+        // grid math would assume tiles the selected kernel does not have.
+        let effective_y64 = mmq_y64 && !matches!(w_dtype, GgmlDType::Q6K);
+        let (mmq_y, nwarps_mmq) = if effective_y64 { (64u32, 8u32) } else { (32u32, 4u32) };
         let col_stride: u32 = std::env::var("CEREBRA_MMQ_COL_STRIDE")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|v| (1..=256).contains(v))
-            .unwrap_or(8);
+            .unwrap_or(2);
         cudarc::driver::LaunchConfig {
             grid_dim: ((n as u32).div_ceil(mmq_y), col_stride, num_experts as u32),
             block_dim: (WARP_SIZE as u32, nwarps_mmq, 1),
