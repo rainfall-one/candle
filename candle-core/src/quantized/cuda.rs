@@ -611,6 +611,12 @@ fn indexed_moe_forward_fused_q8_1_input(
     // per-task vec_dots cost more than the HBM reads they save. Kept
     // behind CEREBRA_MOE_GROUPED=1 for future tuning; default off.
     let total_tasks = batch * topk;
+    // Goal-2500 Step 7.5 (2026-08-31): the `grp_family` (Q8_0, `_grp`
+    // kernels) task-list cap (256, its own kernel's shared-memory limit)
+    // is UNRELATED to and smaller than the MMQ template's IMMQ_MAX_TASKS
+    // (1024) below -- kept as its own gate, untouched, still bounded at
+    // 1024 tasks total (never chunked; Q8_0 experts are not Cerebra's
+    // hot MoE dtypes and this path is off by default regardless).
     let grouped = !std::env::var("CEREBRA_MOE_GROUPED").unwrap_or_default().is_empty()
         && total_tasks > 32
         && total_tasks <= 1024
@@ -628,16 +634,29 @@ fn indexed_moe_forward_fused_q8_1_input(
     // =q4k / =q5k -> MMQ for that dtype only (the other stays
     // task-major) -- correctness bisection for the tiled path.
     let moe_grouped_env = std::env::var("CEREBRA_MOE_GROUPED").unwrap_or_default();
-    let mmq_moe = grouped
-        && match w_dtype {
-            GgmlDType::Q4K => moe_grouped_env == "1" || moe_grouped_env == "q4k",
-            GgmlDType::Q5K => moe_grouped_env == "1" || moe_grouped_env == "q5k",
-            // Step 2 of the Goal-2500 campaign (2026-08-30): Q6K down
-            // projections through the same tiled MMQ path. "q6k" bisects
-            // independently of Q4K/Q5K for correctness isolation.
-            GgmlDType::Q6K => moe_grouped_env == "1" || moe_grouped_env == "q6k",
-            _ => false,
-        };
+    let mmq_eligible_dtype = match w_dtype {
+        GgmlDType::Q4K => moe_grouped_env == "1" || moe_grouped_env == "q4k",
+        GgmlDType::Q5K => moe_grouped_env == "1" || moe_grouped_env == "q5k",
+        // Step 2 of the Goal-2500 campaign (2026-08-30): Q6K down
+        // projections through the same tiled MMQ path. "q6k" bisects
+        // independently of Q4K/Q5K for correctness isolation.
+        GgmlDType::Q6K => moe_grouped_env == "1" || moe_grouped_env == "q6k",
+        _ => false,
+    };
+    // Goal-2500 Step 7.5 (2026-08-31): NO upper bound on total_tasks here
+    // (unlike `grouped` above) -- prefill's total_tasks (seq_len x topk,
+    // e.g. ~20,000 at a 2.5k-token prompt) blew past both the old
+    // `grouped` cap and the MMQ kernel's own IMMQ_MAX_TASKS (1024)
+    // shared-memory task list, so prefill NEVER reached the tiled MMQ
+    // path Steps 1-2 built -- confirmed live via an eager nsys profile
+    // at 2.5k context: MoE prefill through the task-major `_wr` kernels
+    // was ~68% of GPU time, the tiled MMQ kernels combined only ~2.4%.
+    // The launch loop below (`mmq_chunks`) splits any total_tasks count
+    // into IMMQ_MAX_TASKS-sized launches, so this dtype gate no longer
+    // needs to reject large counts -- it always routes MMQ-eligible
+    // dtypes through MMQ when the row-major (`input_dim1 == 1`)
+    // precondition chunking needs holds (checked at the call site).
+    let mmq_moe = total_tasks > 32 && mmq_eligible_dtype;
     // The round-1/2 expert-major vec_dot kernel, kept for Q8_0 when
     // everything is grouped ("1"); dtype-bisect values leave
     // non-selected dtypes on the task-major kernels entirely.
@@ -735,30 +754,93 @@ fn indexed_moe_forward_fused_q8_1_input(
         }
     };
 
-    let mut builder = func.builder();
-    builder.arg(weight);
-    match (&input, &input_quant_owned) {
-        (IndexedMoeInput::Q8_1(view), _) => {
-            builder.arg(view);
-        }
-        (_, Some(buf)) => {
-            builder.arg(buf);
-        }
-        _ => unreachable!("non-Q8_1 inputs always build an owned quantize buffer above"),
-    }
-    builder.arg(ids);
-    builder.arg(&out);
+    // Goal-2500 Step 7.5 (2026-08-31): route the MMQ launch through a
+    // per-chunk loop when `total_tasks` exceeds the MMQ kernel's own
+    // IMMQ_MAX_TASKS (1024, its shared-memory task list's fixed size --
+    // see the kernel's own `#define`) -- prefill's total_tasks (seq_len
+    // x topk, tens of thousands at real prompt lengths) always exceeded
+    // it, so prefill never reached this kernel before (confirmed via
+    // eager nsys profile at 2.5k context: MoE prefill through the
+    // task-major fallback was ~68% of GPU time). Each chunk is an
+    // independent, complete MMQ launch over a disjoint slice of
+    // [batch, topk] rows -- trivially correct (chunks never touch each
+    // other's ids/input/output regions, and every chunk computes
+    // exactly what a smaller standalone call over that row range would).
+    // Only valid for `input_dim1 == 1` (one activation row per token,
+    // routed to `topk` experts) -- the shape every current Cerebra
+    // caller uses, both decode and prefill: chunk boundaries land on
+    // whole TOKEN rows, which only lines up with whole TASK boundaries
+    // (`token_start * topk`) when each token owns exactly one row. A
+    // caller using `input_dim1 == topk` (one row per task) is not
+    // chunked here -- none of Cerebra's callers do, and a wrong
+    // assumption there would corrupt silently, so it falls through to
+    // the single-shot path below (correct, just not chunked -- it would
+    // only be reached with total_tasks <= 1024 in practice since no
+    // such caller exists yet).
+    if mmq_moe && total_tasks > 1024 && input_dim1 == 1 {
+        const IMMQ_MAX_TASKS: usize = 1024;
+        let chunk_tokens = (IMMQ_MAX_TASKS / topk).max(1);
+        let input_view: CudaView<u8> = match (&input, &input_quant_owned) {
+            (IndexedMoeInput::Q8_1(view), _) => view.slice(0..y_size_in_bytes),
+            (_, Some(buf)) => buf.slice(0..y_size_in_bytes),
+            _ => unreachable!("non-Q8_1 inputs always build an owned quantize buffer above"),
+        };
+        let mut token_start = 0usize;
+        while token_start < batch {
+            let chunk_batch = chunk_tokens.min(batch - token_start);
+            let chunk_task_start = token_start * topk;
+            let chunk_tasks = chunk_batch * topk;
 
-    barg!(
-        builder,
-        n as i32,
-        k as i32,
-        batch as i32,
-        topk as i32,
-        k_padded as i32,
-        input_dim1 as i32
-    );
-    unsafe { builder.launch(cfg) }.w()?;
+            let input_chunk = input_view.slice(
+                token_start * dst_row_size_bytes..(token_start + chunk_batch) * dst_row_size_bytes,
+            );
+            let ids_chunk = ids.slice(chunk_task_start..chunk_task_start + chunk_tasks);
+            let out_chunk = out.slice(chunk_task_start * n..(chunk_task_start + chunk_tasks) * n);
+
+            let mut builder = func.builder();
+            builder.arg(weight);
+            builder.arg(&input_chunk);
+            builder.arg(&ids_chunk);
+            builder.arg(&out_chunk);
+            barg!(
+                builder,
+                n as i32,
+                k as i32,
+                chunk_batch as i32,
+                topk as i32,
+                k_padded as i32,
+                input_dim1 as i32
+            );
+            unsafe { builder.launch(cfg) }.w()?;
+
+            token_start += chunk_batch;
+        }
+    } else {
+        let mut builder = func.builder();
+        builder.arg(weight);
+        match (&input, &input_quant_owned) {
+            (IndexedMoeInput::Q8_1(view), _) => {
+                builder.arg(view);
+            }
+            (_, Some(buf)) => {
+                builder.arg(buf);
+            }
+            _ => unreachable!("non-Q8_1 inputs always build an owned quantize buffer above"),
+        }
+        builder.arg(ids);
+        builder.arg(&out);
+
+        barg!(
+            builder,
+            n as i32,
+            k as i32,
+            batch as i32,
+            topk as i32,
+            k_padded as i32,
+            input_dim1 as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
+    }
 
     let mut out_shape = in_shape.dims().to_vec();
     out_shape.pop();
