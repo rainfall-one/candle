@@ -1,6 +1,6 @@
 #![allow(unused)]
 use super::GgmlDType;
-use crate::{CudaDevice, CudaStorage, Error, Result};
+use crate::{CudaDevice, CudaStorage, Error, Result, Tensor};
 
 pub struct QCudaStorage {
     dtype: GgmlDType,
@@ -75,6 +75,13 @@ impl QCudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    /// Stub kept in sync with the real (`cuda.rs`) implementation's
+    /// signature (2026-09-01, Goal-2500 item-3b gate fix): the real
+    /// implementation returns a `Tensor` view into a persistent
+    /// workspace, not a fresh `(CudaStorage, Shape)`, since the
+    /// 2026-09-01 alias-bug fix -- this stub's return type must match
+    /// or every non-CUDA build (Mac dev machines, the `cargo nt` gate)
+    /// fails to compile regardless of whether the caller ever runs it.
     pub fn indexed_moe_forward(
         &self,
         _: &crate::Shape,
@@ -82,7 +89,7 @@ impl QCudaStorage {
         _: &crate::Layout,
         _: &CudaStorage,
         _: &crate::Layout,
-    ) -> Result<(CudaStorage, crate::Shape)> {
+    ) -> Result<Tensor> {
         Err(Error::NotCompiledWithCudaSupport)
     }
 }
