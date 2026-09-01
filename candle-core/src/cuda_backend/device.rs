@@ -757,6 +757,17 @@ impl CudaDevice {
         self.context.alloc_pinned::<T>(len).w()
     }
 
+    /// Real, live `(free_bytes, total_bytes)` for this device, queried
+    /// directly from the driver (`cuMemGetInfo`) -- not an estimate.
+    /// Rainfall-fork addition (2026-09-01, Goal-2500 pre-flight
+    /// admission capacity check): used to reject an admission BEFORE it
+    /// commits to growing the batch capture arena for a new slot-set
+    /// shape, rather than discovering the OOM deep inside a subsequent
+    /// capture or graph-replay call.
+    pub fn mem_get_info(&self) -> Result<(usize, usize)> {
+        self.context.mem_get_info().w()
+    }
+
     /// When turned on, all cuda tensors **created after calling this function** will
     /// not track uses via cuda events.
     ///
