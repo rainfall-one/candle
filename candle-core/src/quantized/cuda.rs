@@ -572,11 +572,32 @@ fn mul_mat_via_q8_1(
 // re-keyed workspace is not created, entries are only ever grown or
 // reused, never shrunk).
 //
+// ALIAS-BUG CORRECTION (2026-09-01): this section originally claimed the
+// three cases below were exhaustive -- "single outstanding view" was an
+// unstated assumption, not something the three traced cases actually
+// established. A FOURTH real call pattern was found that breaks it:
+// `RoutedProjections::Separate` (quantized_experts.rs) issues TWO
+// `indexed_moe_forward` calls (gate, then up) BEFORE consuming either --
+// both returned views alias the SAME `out` buffer, so the second call's
+// kernel launch overwrote the first view's memory before it was ever
+// read (silent SwiGLU corruption on this non-default path). Fixed by
+// making `out` a small SLOT RING (`out_slots` below): each acquisition
+// picks the first slot whose storage is not still aliased by a live
+// caller-held view (`Tensor::storage_strong_count() <= 1`), growing that
+// slot if needed, or appending a new slot if every existing one is still
+// aliased. This closes the Separate-path bug AND any future multi-call-
+// before-consume pattern by construction -- no per-call-site special
+// casing, no dependence on enumerating every caller. The three cases
+// below remain true and are why the FUSED path (and any single-call
+// site) always finds slot 0 unaliased and never grows past one slot in
+// steady state -- they are no longer read as an exhaustiveness claim.
+//
 // SAFETY OF REUSE (why cross-call/cross-layer sharing of one workspace
-// never races -- every consumer of a workspace-derived view is
-// stream-ordered strictly AFTER the write that produced it, on the SAME
-// stream, so the NEXT write reusing that memory is always safe by CUDA's
-// single-stream execution-order guarantee, never by timing):
+// never races on the FUSED/single-view path -- every consumer of a
+// workspace-derived view is stream-ordered strictly AFTER the write that
+// produced it, on the SAME stream, so the NEXT write reusing that slot's
+// memory is always safe by CUDA's single-stream execution-order
+// guarantee, never by timing):
 //   1. Within one MoE layer, gate_up's kernel writes the workspace, its
 //      output is fully consumed (activation + re-quantize) by candle ops
 //      BEFORE down's own call reuses the same workspace (moe_ffn.rs's
@@ -617,9 +638,18 @@ fn mul_mat_via_q8_1(
 // since replay preserves the captured ordering by construction and the
 // risky moments are exactly the eager/capture-time dispatches where the
 // assert DOES run.
+/// One `out` buffer in a workspace entry's slot ring, with its own
+/// independently-tracked capacity -- slots grow independently since a
+/// caller pattern that keeps one view alive longer (e.g. `gate_raw`
+/// held across the `up` call) shouldn't force every slot to the max
+/// size ever requested of any of them.
+struct MoeOutSlot {
+    tensor: Tensor,
+    capacity: usize, // f32 elements
+}
+
 struct MoeWorkspaceEntry {
-    out: Tensor,
-    out_capacity: usize, // f32 elements
+    out_slots: Vec<MoeOutSlot>,
     input_quant: CudaSlice<u8>,
     input_quant_capacity: usize, // bytes
     stream_ptr: usize,
@@ -635,39 +665,59 @@ fn moe_workspace_key(dev: &CudaDevice) -> MoeWorkspaceKey {
     (dev.id(), stream_ptr)
 }
 
-/// Ensures a workspace entry exists for `dev`'s (device, stream) key with
-/// capacity for at least `out_elems` f32 output elements and
-/// `input_bytes` bytes of Q8_1-quantized input scratch, growing (never
-/// shrinking) if the existing entry -- or lack of one -- is too small.
-/// Returns the entry's key so the caller can look it back up under the
-/// same lock scope needed for the actual kernel dispatch.
-fn moe_workspace_ensure(dev: &CudaDevice, out_elems: usize, input_bytes: usize) -> Result<MoeWorkspaceKey> {
+/// Ensures a workspace entry exists for `dev`'s (device, stream) key,
+/// with an out-slot ready for `out_elems` f32 output elements and
+/// `input_bytes` bytes of Q8_1-quantized input scratch.
+///
+/// Alias-safe slot selection (2026-09-01, see the alias-bug correction
+/// above `MoeWorkspaceEntry`): scans `out_slots` for the first slot whose
+/// storage is not still aliased by a live caller-held view
+/// (`Tensor::storage_strong_count() <= 1` -- the map's own entry is the
+/// only reference), growing that slot in place if it's too small. If
+/// EVERY existing slot is still aliased, appends a new slot sized to
+/// `out_elems`. Slots are never removed once allocated (same
+/// never-shrink policy as capacity growth) -- a caller pattern that
+/// needs N concurrent live views steady-states at N slots after its
+/// first occurrence, zero allocation on every call after that.
+///
+/// Returns the entry's key plus the chosen slot's index, so the caller
+/// can look both back up under the same lock scope needed for the
+/// actual kernel dispatch.
+fn moe_workspace_ensure(dev: &CudaDevice, out_elems: usize, input_bytes: usize) -> Result<(MoeWorkspaceKey, usize)> {
     let key = moe_workspace_key(dev);
     let map_lock = MOE_WORKSPACE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut map = map_lock.lock().expect("moe workspace mutex poisoned");
-    let needs_alloc = match map.get(&key) {
-        Some(entry) => entry.out_capacity < out_elems || entry.input_quant_capacity < input_bytes,
-        None => true,
-    };
-    if needs_alloc {
-        let prior_out_cap = map.get(&key).map(|e| e.out_capacity).unwrap_or(0);
-        let prior_in_cap = map.get(&key).map(|e| e.input_quant_capacity).unwrap_or(0);
-        let new_out_cap = out_elems.max(prior_out_cap);
-        let new_in_cap = input_bytes.max(prior_in_cap);
-        let out = Tensor::zeros(new_out_cap, crate::DType::F32, &crate::Device::Cuda(dev.clone()))?;
-        let input_quant = unsafe { dev.alloc::<u8>(new_in_cap) }?;
+
+    if !map.contains_key(&key) {
+        let input_quant = unsafe { dev.alloc::<u8>(input_bytes) }?;
         map.insert(
             key,
-            MoeWorkspaceEntry {
-                out,
-                out_capacity: new_out_cap,
-                input_quant,
-                input_quant_capacity: new_in_cap,
-                stream_ptr: key.1,
-            },
+            MoeWorkspaceEntry { out_slots: Vec::new(), input_quant, input_quant_capacity: input_bytes, stream_ptr: key.1 },
         );
     }
-    Ok(key)
+    let entry = map.get_mut(&key).expect("just inserted or already present");
+
+    if entry.input_quant_capacity < input_bytes {
+        entry.input_quant = unsafe { dev.alloc::<u8>(input_bytes) }?;
+        entry.input_quant_capacity = input_bytes;
+    }
+
+    let unaliased_slot = entry.out_slots.iter().position(|slot| slot.tensor.storage_strong_count() <= 1);
+    let slot_idx = match unaliased_slot {
+        Some(idx) => {
+            if entry.out_slots[idx].capacity < out_elems {
+                entry.out_slots[idx].tensor = Tensor::zeros(out_elems, crate::DType::F32, &crate::Device::Cuda(dev.clone()))?;
+                entry.out_slots[idx].capacity = out_elems;
+            }
+            idx
+        }
+        None => {
+            let tensor = Tensor::zeros(out_elems, crate::DType::F32, &crate::Device::Cuda(dev.clone()))?;
+            entry.out_slots.push(MoeOutSlot { tensor, capacity: out_elems });
+            entry.out_slots.len() - 1
+        }
+    };
+    Ok((key, slot_idx))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -717,10 +767,9 @@ fn indexed_moe_forward_fused_q8_1_input(
     // the lock is re-acquired and held for the rest of this function so
     // every kernel launch below writes into the SAME entry it was sized
     // for -- no lookup/replace race between the grow and the actual use.
-    moe_workspace_ensure(dev, outsize, y_size_in_bytes)?;
+    let (key, slot_idx) = moe_workspace_ensure(dev, outsize, y_size_in_bytes)?;
     let map_lock = MOE_WORKSPACE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut map = map_lock.lock().expect("moe workspace mutex poisoned");
-    let key = moe_workspace_key(dev);
     let entry = map.get_mut(&key).expect("moe_workspace_ensure just populated this key");
     assert_eq!(
         entry.stream_ptr, key.1,
@@ -756,7 +805,7 @@ fn indexed_moe_forward_fused_q8_1_input(
         }
     };
 
-    let mut out_storage_guard = entry.out.storage_mut_and_layout().0;
+    let mut out_storage_guard = entry.out_slots[slot_idx].tensor.storage_mut_and_layout().0;
     let out: &mut CudaSlice<f32> = match &mut *out_storage_guard {
         crate::Storage::Cuda(storage) => storage.as_cuda_slice_mut::<f32>()?,
         _ => unreachable!("moe workspace `out` is always constructed as a CUDA F32 tensor"),
@@ -764,7 +813,10 @@ fn indexed_moe_forward_fused_q8_1_input(
     if !std::env::var("CEREBRA_MMQ_PTR_TRACE").unwrap_or_default().is_empty() {
         use cudarc::driver::DevicePtr;
         let ptr = out.device_ptr(&dev.cuda_stream()).0;
-        eprintln!("cerebra out ptr trace: workspace ptr={:#014x} outsize={outsize} capacity={}", ptr, entry.out_capacity);
+        eprintln!(
+            "cerebra out ptr trace: workspace ptr={:#014x} outsize={outsize} slot={slot_idx} capacity={}",
+            ptr, entry.out_slots[slot_idx].capacity
+        );
     }
 
     // Warp-per-row variant for SMALL-K rows (rainfall-one, 2026-08-29):
@@ -879,13 +931,14 @@ fn indexed_moe_forward_fused_q8_1_input(
     // re-measure of this env, not a kernel rebuild.
     let mmq_y64 = std::env::var("CEREBRA_MMQ_GEOM").as_deref() == Ok("y64");
     let (kernel_name, warp_rows) = if mma_moe {
-        // Goal-2500 Step 6 M1: only one geometry compiled so far (16-row
-        // tile, one warp/block, matching the mma.m16n8k32 instruction's
-        // own shape -- not a tunable the way dp4a's mmq_y/nwarps are).
-        // `k` MUST be a multiple of QK_K=256 (asserted below, loudly --
-        // the poison-arm lesson: a silent geometry mismatch here would
-        // profile as something unrelated).
-        ("indexed_mul_mat_q4_K_moe_mma", false)
+        // Goal-2500 Lane A / A2 (2026-09-01): the 8-warp/128-row geometry
+        // ported from llama.cpp's real Ampere Q4_K MMQ config replaces
+        // the killed M1/M2 one-warp/16-row geometry (measured ~41% of
+        // dp4a throughput at N=128, col_stride swept -- see campaign
+        // memory for the full verdict; that kernel stays in the fork,
+        // gated off, as a documented dead end, not deleted). `k` MUST be
+        // a multiple of QK_K=256 (asserted below).
+        ("indexed_mul_mat_q4_K_moe_mma8w", false)
     } else if mmq_moe {
         let name = match (w_dtype, mmq_y64) {
             (GgmlDType::Q4K, false) => "indexed_mul_mat_q4_K_moe",
@@ -944,21 +997,22 @@ fn indexed_moe_forward_fused_q8_1_input(
         }
     }
     let cfg = if mma_moe {
-        // Goal-2500 Step 6 M1: one warp (32 threads, nwarps=1) per
-        // (16-row tile, col-tile-stride-wide task tile) -- fixed by the
-        // mma.m16n8k32 instruction's own shape, not a dp4a-style tunable.
-        // Column-tile stride IS env-tunable per device (mirrors
-        // CEREBRA_MMQ_COL_STRIDE's own precedent) -- default unmeasured
-        // until M2's sweep picks a real A100 value; 4 is a placeholder
-        // that only needs to be correct, not fast, until then.
+        // Goal-2500 Lane A / A2: 8 warps (256 threads) per (128-row tile,
+        // col-tile-stride-wide 8-task tile) -- I=128/nthreads=256 fixed
+        // by llama.cpp's real Ampere Q4_K MMQ config
+        // (mmq-config-ampere.cuh CASE(GGML_TYPE_Q4_K, 256, 1, 128, 8, ...),
+        // pinned commit 0eadefebd3f8f92a86d634a0e5b8fffc9dc792c0), not a
+        // dp4a-style tunable. Column-tile stride IS env-tunable per
+        // device (same CEREBRA_MMQ_MMA_COL_STRIDE precedent); default
+        // still unmeasured until A3's sweep picks a real A100 value.
         let col_stride: u32 = std::env::var("CEREBRA_MMQ_MMA_COL_STRIDE")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|v| (1..=256).contains(v))
             .unwrap_or(4);
         cudarc::driver::LaunchConfig {
-            grid_dim: ((n as u32).div_ceil(16), col_stride, num_experts as u32),
-            block_dim: (WARP_SIZE as u32, 1, 1),
+            grid_dim: ((n as u32).div_ceil(128), col_stride, num_experts as u32),
+            block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         }
     } else if mmq_moe {
@@ -1210,7 +1264,7 @@ fn indexed_moe_forward_fused_q8_1_input(
     // reads the storage via its own (shared) lock internally, and holding
     // the write guard here would deadlock against that.
     drop(out_storage_guard);
-    let result = entry.out.narrow(0, 0, outsize)?.reshape(out_shape)?;
+    let result = entry.out_slots[slot_idx].tensor.narrow(0, 0, outsize)?.reshape(out_shape)?;
     Ok(result)
 }
 

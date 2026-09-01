@@ -2758,6 +2758,20 @@ impl Tensor {
         std::ptr::eq(lhs, rhs)
     }
 
+    /// Strong-reference count of this tensor's underlying storage `Arc`.
+    ///
+    /// A count of 1 means no other `Tensor` (view or otherwise) currently
+    /// shares this storage. Used by the MoE persistent-workspace
+    /// alias-guard (`quantized/cuda.rs`'s `MoeWorkspaceEntry`) to detect
+    /// when a caller still holds a live view into a workspace-backed
+    /// tensor before the workspace is reused for a new call -- reusing a
+    /// still-aliased buffer would silently clobber the caller's earlier
+    /// view (see that module's `RoutedProjections::Separate` alias-bug
+    /// fix, 2026-09-01).
+    pub(crate) fn storage_strong_count(&self) -> usize {
+        Arc::strong_count(&self.storage)
+    }
+
     /// Normalize a 'relative' axis value: positive values are kept, negative
     /// values means counting the dimensions from the back.
     pub fn normalize_axis(&self, axis: i64) -> Result<usize> {
