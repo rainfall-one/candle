@@ -5456,3 +5456,7 @@ extern "C" __global__ void indexed_moe_forward_q8_0_q8_1_grp(
     indexed_moe_forward_grouped<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
         (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
 }
+
+// Goal-2500 Step 6: tensor-core int8 mma MMQ, Q4K indexed-MoE.
+#include "mmq_mma.cuh"
+#include "indexed_mul_mat_q4_K_moe_mma.cuh"

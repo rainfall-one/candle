@@ -657,11 +657,22 @@ fn indexed_moe_forward_fused_q8_1_input(
     // dtypes through MMQ when the row-major (`input_dim1 == 1`)
     // precondition chunking needs holds (checked at the call site).
     let mmq_moe = total_tasks > 32 && mmq_eligible_dtype;
+    // Goal-2500 Step 6 (2026-09-01): tensor-core int8 mma MMQ, THIRD tier
+    // ahead of the dp4a mmq_moe tier -- CEREBRA_MMQ_MMA=1 selects it, and
+    // ONLY for Q4K (M1's dtype; Q5K/Q6K land in M4). Non-Q4K dtypes and
+    // env-off fall straight through to the existing mmq_moe/grp_family/
+    // task-major chain below, untouched. `mma_moe` and `mmq_moe` are
+    // mutually exclusive by construction (this dtype gate), so `grp_family`
+    // below (which already excludes `mmq_moe`) needs no separate mma
+    // exclusion.
+    let mma_moe =
+        !std::env::var("CEREBRA_MMQ_MMA").unwrap_or_default().is_empty() && total_tasks > 32 && matches!(w_dtype, GgmlDType::Q4K);
     // The round-1/2 expert-major vec_dot kernel, kept for Q8_0 when
     // everything is grouped ("1"); dtype-bisect values leave
     // non-selected dtypes on the task-major kernels entirely.
     let grp_family = grouped
         && !mmq_moe
+        && !mma_moe
         && moe_grouped_env == "1"
         && matches!(w_dtype, GgmlDType::Q8_0);
     // Per-device geometry (never hardcode for one card): both compiled
@@ -670,7 +681,15 @@ fn indexed_moe_forward_fused_q8_1_input(
     // the A100-40GB-measured best. A new device class (H200, ...) is a
     // re-measure of this env, not a kernel rebuild.
     let mmq_y64 = std::env::var("CEREBRA_MMQ_GEOM").as_deref() == Ok("y64");
-    let (kernel_name, warp_rows) = if mmq_moe {
+    let (kernel_name, warp_rows) = if mma_moe {
+        // Goal-2500 Step 6 M1: only one geometry compiled so far (16-row
+        // tile, one warp/block, matching the mma.m16n8k32 instruction's
+        // own shape -- not a tunable the way dp4a's mmq_y/nwarps are).
+        // `k` MUST be a multiple of QK_K=256 (asserted below, loudly --
+        // the poison-arm lesson: a silent geometry mismatch here would
+        // profile as something unrelated).
+        ("indexed_mul_mat_q4_K_moe_mma", false)
+    } else if mmq_moe {
         let name = match (w_dtype, mmq_y64) {
             (GgmlDType::Q4K, false) => "indexed_mul_mat_q4_K_moe",
             (GgmlDType::Q5K, false) => "indexed_mul_mat_q5_K_moe",
@@ -714,7 +733,38 @@ fn indexed_moe_forward_fused_q8_1_input(
     } else {
         (n as u32, 4)
     };
-    let cfg = if mmq_moe {
+    // Goal-2500 Step 6: launch-config assertions for the mma tile's own
+    // shape assumptions -- the poison-arm lesson (a silent geometry
+    // mismatch profiles as something else entirely, not a crash) applies
+    // doubly here since this is the first tier whose row/K tiling isn't
+    // just "one row or 4 rows per warp" but a fixed 16x8 hardware tile.
+    if mma_moe {
+        if k % 256 != 0 {
+            crate::bail!("indexed_mul_mat_q4_K_moe_mma: k={k} must be a multiple of QK_K=256");
+        }
+        if n == 0 {
+            crate::bail!("indexed_mul_mat_q4_K_moe_mma: n=0 (no output rows)");
+        }
+    }
+    let cfg = if mma_moe {
+        // Goal-2500 Step 6 M1: one warp (32 threads, nwarps=1) per
+        // (16-row tile, col-tile-stride-wide task tile) -- fixed by the
+        // mma.m16n8k32 instruction's own shape, not a dp4a-style tunable.
+        // Column-tile stride IS env-tunable per device (mirrors
+        // CEREBRA_MMQ_COL_STRIDE's own precedent) -- default unmeasured
+        // until M2's sweep picks a real A100 value; 4 is a placeholder
+        // that only needs to be correct, not fast, until then.
+        let col_stride: u32 = std::env::var("CEREBRA_MMQ_MMA_COL_STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| (1..=256).contains(v))
+            .unwrap_or(4);
+        cudarc::driver::LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(16), col_stride, num_experts as u32),
+            block_dim: (WARP_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    } else if mmq_moe {
         // Geometry must mirror the kernel's IMMQ constants: Q4K runs
         // (mmq_y 32, nwarps 4), Q5K (mmq_y 64, nwarps 8). grid.y = 8
         // column-tile strides (hot experts loop in-kernel, see the
@@ -777,7 +827,17 @@ fn indexed_moe_forward_fused_q8_1_input(
     // the single-shot path below (correct, just not chunked -- it would
     // only be reached with total_tasks <= 1024 in practice since no
     // such caller exists yet).
-    if mmq_moe && total_tasks > 1024 && input_dim1 == 1 {
+    // Goal-2500 Step 6 (2026-09-01): the mma tier routes through this
+    // SAME loop, not a second chunking path -- `func`/`cfg` are already
+    // tier-dispatched above, so this loop just launches whichever kernel
+    // was selected, chunk after chunk. `IMMQ_MAX_TASKS` is re-derived
+    // (not assumed) for the mma kernel too: its own task_list is sized
+    // identically (1024 unsigned shorts, same shared-memory budget) --
+    // confirmed by reading indexed_mul_mat_q4_K_moe_mma's own
+    // IMMQ_MMA_MAX_TASKS definition, not copied blindly. If a future mma
+    // dtype ever needs a different in-block cap, this condition and the
+    // constant below both need to become per-tier.
+    if (mmq_moe || mma_moe) && total_tasks > 1024 && input_dim1 == 1 {
         const IMMQ_MAX_TASKS: usize = 1024;
         let chunk_tokens = (IMMQ_MAX_TASKS / topk).max(1);
         let input_view: CudaView<u8> = match (&input, &input_quant_owned) {
