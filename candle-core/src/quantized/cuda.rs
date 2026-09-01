@@ -1,7 +1,7 @@
 use super::{GgmlDType, QStorage};
 use crate::quantized::k_quants::GgmlType;
 use crate::{backend::BackendDevice, cuda_backend::WrapErr};
-use crate::{builder_arg as barg, CudaDevice, CudaStorage, Result};
+use crate::{builder_arg as barg, CudaDevice, CudaStorage, Result, Tensor};
 use half::{bf16, f16};
 
 use cudarc::driver::{CudaSlice, CudaView, PushKernelArg};
@@ -509,6 +509,167 @@ fn mul_mat_via_q8_1(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+// Goal-2500 Step 6 alias-bug fix (2026-09-01): a documented Rainfall-fork
+// driver defect (see `CUDARC_DISABLE_ASYNC_ALLOC`'s own comment,
+// driver/safe/core.rs) makes `cuMemAllocAsync` unreliable on this
+// hardware/driver/passthrough combination -- a freshly-cycled pool buffer
+// that a KERNEL scatter-writes into (this MoE forward's `out`, formerly a
+// fresh `unsafe { dev.alloc }` every call) can silently receive wrong
+// data. Root-caused via the mma tensor-core tier's rigor (byte-level
+// checksums, offline replay, launch-time instrumentation); dp4a is
+// exposed to the identical defect (nothing about it is mma-specific) but
+// has not corrupted in practice -- evidence the defect is triggered by a
+// kernel's OWN scatter-write into a freshly-cycled buffer specifically,
+// not by generic device memory traffic against the same pool.
+//
+// FIX: a persistent, per-(device,stream) workspace `Tensor`, grown
+// on-demand and reused across every call -- `out`'s kernel write target
+// is stable device memory that (after warmup) is never freshly cycled
+// through the driver's pool at all, sidestepping the defect's window
+// entirely rather than depending on the `CUDARC_DISABLE_ASYNC_ALLOC`
+// escape hatch (benchmarked separately: that blanket fix OOMs the whole
+// engine at real concurrency, N=128, because `cuMemAlloc` doesn't pool --
+// not viable here).
+//
+// Zero-alloc sharing works because candle's OWN `Arc<RwLock<Storage>>`
+// (at the `Tensor` layer, not `CudaStorage`/`CudaSlice`, which own their
+// memory directly and have no non-owning view variant) does the Arc
+// bookkeeping: this function mutates the workspace tensor's storage in
+// place via crate-internal accessors, then returns `workspace.narrow(0,
+// 0, outsize)` -- a normal, PUBLIC Tensor op producing a view that
+// shares the SAME Arc, with no ownership hand-rolling and no risk of a
+// double-free or premature-free (there is exactly one owner, the static
+// map, and every returned Tensor is just another ref-counted handle to
+// it).
+//
+// KEYED BY (DeviceId, stream pointer), not a single process-wide
+// instance: a second CUDA device, a second engine instance, or any
+// caller on a different stream must get its OWN workspace entry --
+// sharing across streams would be the exact cross-stream aliasing this
+// whole investigation exists to eliminate. The Mutex only serializes
+// host-side lookup/replace; safety comes from each entry being used by
+// exactly one stream, not from the lock.
+//
+// SIZED BY GROWTH, not a hardcoded ceiling: this is a general candle-core
+// function, not something that may bake in one model's geometry (a
+// standing rule -- never tune a general library function to the observed
+// instance). Each call computes its demanded size; if the keyed entry is
+// absent or too small, a larger `Tensor` replaces it. Growth is safe
+// because of Arc semantics alone: any in-flight narrowed view (e.g. a
+// deferred `pending_moe`) holds its own ref to the OLD tensor, which
+// stays alive via that ref until its last consumer drops it, regardless
+// of the map moving on to a new one. Steady state (the overwhelming
+// majority of calls, once every distinct shape class has been seen once)
+// performs zero allocation.
+//
+// TEARDOWN: a workspace entry holds device memory until its last Arc ref
+// (map entry + any outstanding views) drops -- for the live server this
+// is effectively "until process exit," which is fine (matches every
+// other piece of persistent engine state). Test code that creates many
+// short-lived `CudaDevice`s should expect this map to accumulate one
+// entry per distinct (device,stream) it touches; the growth-replace path
+// is also how a test harness recovers if that ever matters (a smaller
+// re-keyed workspace is not created, entries are only ever grown or
+// reused, never shrunk).
+//
+// SAFETY OF REUSE (why cross-call/cross-layer sharing of one workspace
+// never races -- every consumer of a workspace-derived view is
+// stream-ordered strictly AFTER the write that produced it, on the SAME
+// stream, so the NEXT write reusing that memory is always safe by CUDA's
+// single-stream execution-order guarantee, never by timing):
+//   1. Within one MoE layer, gate_up's kernel writes the workspace, its
+//      output is fully consumed (activation + re-quantize) by candle ops
+//      BEFORE down's own call reuses the same workspace (moe_ffn.rs's
+//      quantized-path glue, sequential ops on one stream).
+//   2. Across layers, the decoder defers each layer's MoE residual into
+//      the NEXT layer via `pending_moe: Option<Tensor>` (model.rs) --
+//      a genuine cross-layer view lifetime, exactly what this design's
+//      Arc-sharing must get right. Traced precisely:
+//      `residual_rmsnorm(x, pending_delta, ...)` at the TOP of
+//      `TransformerLayer::forward_decode_fused` (layer.rs:134-176)
+//      consumes the previous layer's deferred `moe_out` (a workspace
+//      view) strictly BEFORE that same call's OWN `self.moe.forward_with_q8`
+//      (the bottom, step 4) produces a NEW `moe_out` that reuses/regrows
+//      the workspace. Sequential kernel launches, one stream -- read
+//      completes before reuse, holds at cross-layer granularity by the
+//      same argument as the within-layer case.
+//   3. The ONE actual multi-stream mechanism in this codebase
+//      (`CudaDevice::fork_side_branch`, single call site moe_ffn.rs:329)
+//      forks the SHARED expert's front half onto a side stream,
+//      capture-time only -- it provably never touches this workspace
+//      (disjoint buffers: shared-expert and routed-expert weights are
+//      separate objects with separate forward methods; the fork is
+//      paused before routed experts run and joined before the combine
+//      reads both branches). This workspace must NEVER be handed to that
+//      side-branch code path; it structurally cannot reach it today. If
+//      a future optimization ever widens the side-branch window to cover
+//      routed-expert work, this is exactly the assumption that breaks --
+//      the runtime stream-identity assert is the tripwire for that, not
+//      a substitute for re-auditing this comment then.
+//
+// RUNTIME TRIPWIRE: every call asserts the CURRENT dispatch's stream
+// matches the workspace entry's recorded stream (redundant with the
+// keying above under normal operation, but keying only prevents a NEW
+// entry from being shared across streams -- it does not catch a bug that
+// somehow reuses an existing key's entry from the wrong stream). This
+// guards eager and capture-recording paths; it does NOT run during
+// CUDA-graph REPLAY (replay bypasses host code entirely) -- acceptable,
+// since replay preserves the captured ordering by construction and the
+// risky moments are exactly the eager/capture-time dispatches where the
+// assert DOES run.
+struct MoeWorkspaceEntry {
+    out: Tensor,
+    out_capacity: usize, // f32 elements
+    input_quant: CudaSlice<u8>,
+    input_quant_capacity: usize, // bytes
+    stream_ptr: usize,
+}
+
+type MoeWorkspaceKey = (crate::cuda_backend::DeviceId, usize);
+
+static MOE_WORKSPACE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<MoeWorkspaceKey, MoeWorkspaceEntry>>> =
+    std::sync::OnceLock::new();
+
+fn moe_workspace_key(dev: &CudaDevice) -> MoeWorkspaceKey {
+    let stream_ptr = std::sync::Arc::as_ptr(&dev.cuda_stream()) as usize;
+    (dev.id(), stream_ptr)
+}
+
+/// Ensures a workspace entry exists for `dev`'s (device, stream) key with
+/// capacity for at least `out_elems` f32 output elements and
+/// `input_bytes` bytes of Q8_1-quantized input scratch, growing (never
+/// shrinking) if the existing entry -- or lack of one -- is too small.
+/// Returns the entry's key so the caller can look it back up under the
+/// same lock scope needed for the actual kernel dispatch.
+fn moe_workspace_ensure(dev: &CudaDevice, out_elems: usize, input_bytes: usize) -> Result<MoeWorkspaceKey> {
+    let key = moe_workspace_key(dev);
+    let map_lock = MOE_WORKSPACE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = map_lock.lock().expect("moe workspace mutex poisoned");
+    let needs_alloc = match map.get(&key) {
+        Some(entry) => entry.out_capacity < out_elems || entry.input_quant_capacity < input_bytes,
+        None => true,
+    };
+    if needs_alloc {
+        let prior_out_cap = map.get(&key).map(|e| e.out_capacity).unwrap_or(0);
+        let prior_in_cap = map.get(&key).map(|e| e.input_quant_capacity).unwrap_or(0);
+        let new_out_cap = out_elems.max(prior_out_cap);
+        let new_in_cap = input_bytes.max(prior_in_cap);
+        let out = Tensor::zeros(new_out_cap, crate::DType::F32, &crate::Device::Cuda(dev.clone()))?;
+        let input_quant = unsafe { dev.alloc::<u8>(new_in_cap) }?;
+        map.insert(
+            key,
+            MoeWorkspaceEntry {
+                out,
+                out_capacity: new_out_cap,
+                input_quant,
+                input_quant_capacity: new_in_cap,
+                stream_ptr: key.1,
+            },
+        );
+    }
+    Ok(key)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn indexed_moe_forward_fused_q8_1_input(
     weight: &CudaView<u8>,
@@ -519,7 +680,7 @@ fn indexed_moe_forward_fused_q8_1_input(
     ids: &CudaView<u32>,
     idx_shape: &crate::Shape, //[batch, topk]
     dev: &CudaDevice,
-) -> Result<(CudaStorage, crate::Shape)> {
+) -> Result<Tensor> {
     let (num_experts, n, k) = w_shape.dims3()?;
     let batch = in_shape.dims()[0];
     let input_dim1 = in_shape.dims()[1];
@@ -545,7 +706,31 @@ fn indexed_moe_forward_fused_q8_1_input(
     // every byte before any read.
     // A pre-quantized (Q8_1) input skips the buffer and the quantize
     // pass entirely -- the caller's blocks feed the kernel directly.
-    let input_quant_owned = match &input {
+    // output buffer -- shape known up front, needed to size the workspace.
+    let outsize = batch * topk * n;
+
+    // Alias-bug fix (2026-09-01, see this function's own preceding header
+    // comment for the full design/safety argument): both the input-quant
+    // scratch and the output live in a persistent, per-(device,stream)
+    // workspace, grown on demand, instead of a fresh per-call
+    // `dev.alloc`. `moe_workspace_ensure` grows the entry if needed, then
+    // the lock is re-acquired and held for the rest of this function so
+    // every kernel launch below writes into the SAME entry it was sized
+    // for -- no lookup/replace race between the grow and the actual use.
+    moe_workspace_ensure(dev, outsize, y_size_in_bytes)?;
+    let map_lock = MOE_WORKSPACE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = map_lock.lock().expect("moe workspace mutex poisoned");
+    let key = moe_workspace_key(dev);
+    let entry = map.get_mut(&key).expect("moe_workspace_ensure just populated this key");
+    assert_eq!(
+        entry.stream_ptr, key.1,
+        "indexed_moe_forward: workspace entry's recorded stream does not match the current \
+         dispatch's stream -- see this function's RUNTIME TRIPWIRE comment above. This should be \
+         unreachable given the (device,stream) keying; if it fires, the keying itself has a gap, \
+         not just this assert."
+    );
+
+    let input_quant_owned: Option<CudaView<'_, u8>> = match &input {
         IndexedMoeInput::Q8_1(view) => {
             if view.len() < y_size_in_bytes {
                 crate::bail!(
@@ -556,35 +741,31 @@ fn indexed_moe_forward_fused_q8_1_input(
             None
         }
         IndexedMoeInput::F32(view) => {
-            let mut buf = if k_padded == k {
-                unsafe { dev.alloc::<u8>(y_size_in_bytes) }?
-            } else {
-                dev.alloc_zeros::<u8>(y_size_in_bytes)?
-            };
-            quantize_q8_1(view, &mut buf, k, total_rows, dev)?;
-            Some(buf)
+            // Pass the FULL persistent scratch (capacity >= y_size_in_bytes,
+            // possibly larger from an earlier bigger call) -- `quantize_q8_1`
+            // only writes the `total_rows`/`k`-derived prefix it computes
+            // internally, matching exactly `y_size_in_bytes`; any extra
+            // capacity is simply untouched, not read by the caller below
+            // either (sliced to `0..y_size_in_bytes` there).
+            quantize_q8_1(view, &mut entry.input_quant, k, total_rows, dev)?;
+            Some(entry.input_quant.slice(0..y_size_in_bytes))
         }
         IndexedMoeInput::Bf16(view) => {
-            let mut buf = if k_padded == k {
-                unsafe { dev.alloc::<u8>(y_size_in_bytes) }?
-            } else {
-                dev.alloc_zeros::<u8>(y_size_in_bytes)?
-            };
-            quantize_q8_1_from_bf16(view, &mut buf, k, total_rows, dev)?;
-            Some(buf)
+            quantize_q8_1_from_bf16(view, &mut entry.input_quant, k, total_rows, dev)?;
+            Some(entry.input_quant.slice(0..y_size_in_bytes))
         }
     };
 
-    // output buffer
-    let outsize = batch * topk * n;
-    // SAFETY: `indexed_moe_forward` writes every (task, row) output
-    // element exactly once (`current_output_ptr[row0] = tmp`,
-    // unconditional store, grid covers n x batch x topk) -- the
-    // zero-init this replaced was pure overhead, and inside a CUDA
-    // graph capture it recorded one memset node per call (audited live
-    // at 240 memset nodes/decode-step on rainfall-one's Cerebra:
-    // 3 calls x ~40 MoE layers x 2 buffers, 2026-08-28).
-    let out = unsafe { dev.alloc::<f32>(outsize) }?;
+    let mut out_storage_guard = entry.out.storage_mut_and_layout().0;
+    let out: &mut CudaSlice<f32> = match &mut *out_storage_guard {
+        crate::Storage::Cuda(storage) => storage.as_cuda_slice_mut::<f32>()?,
+        _ => unreachable!("moe workspace `out` is always constructed as a CUDA F32 tensor"),
+    };
+    if !std::env::var("CEREBRA_MMQ_PTR_TRACE").unwrap_or_default().is_empty() {
+        use cudarc::driver::DevicePtr;
+        let ptr = out.device_ptr(&dev.cuda_stream()).0;
+        eprintln!("cerebra out ptr trace: workspace ptr={:#014x} outsize={outsize} capacity={}", ptr, entry.out_capacity);
+    }
 
     // Warp-per-row variant for SMALL-K rows (rainfall-one, 2026-08-29):
     // with `k / QK_K <= 4` k-blocks per row, the block-per-row shape
@@ -667,6 +848,22 @@ fn indexed_moe_forward_fused_q8_1_input(
     // exclusion.
     let mma_moe =
         !std::env::var("CEREBRA_MMQ_MMA").unwrap_or_default().is_empty() && total_tasks > 32 && matches!(w_dtype, GgmlDType::Q4K);
+    // Shape census (2026-09-01, kona-a0 plan step a): env-gated, logs every
+    // mma-dispatched call's shape so the live dispatch surface (which call
+    // classes actually hit mma_moe -- gate_up vs down-projection, k_padded
+    // vs k, both input_dim1 arms) can be enumerated instead of guessed.
+    // Cheap enough to leave in permanently behind the env gate.
+    if mma_moe && !std::env::var("CEREBRA_MMQ_MMA_TRACE").unwrap_or_default().is_empty() {
+        let input_arm = match &input {
+            IndexedMoeInput::Q8_1(_) => "Q8_1(caller-provided)",
+            IndexedMoeInput::F32(_) => "F32(quantize-on-the-fly)",
+            IndexedMoeInput::Bf16(_) => "Bf16(quantize-on-the-fly)",
+        };
+        eprintln!(
+            "cerebra mma_moe dispatch: w_dtype={w_dtype:?} n={n} k={k} k_padded={k_padded} \
+             input_dim1={input_dim1} total_tasks={total_tasks} num_experts={num_experts} input_arm={input_arm}"
+        );
+    }
     // The round-1/2 expert-major vec_dot kernel, kept for Q8_0 when
     // everything is grouped ("1"); dtype-bisect values leave
     // non-selected dtypes on the task-major kernels entirely.
@@ -837,6 +1034,47 @@ fn indexed_moe_forward_fused_q8_1_input(
     // IMMQ_MMA_MAX_TASKS definition, not copied blindly. If a future mma
     // dtype ever needs a different in-block cap, this condition and the
     // constant below both need to become per-tier.
+    // Goal-2500 Step 6 debug instrument (2026-09-01, kona-a0 plan item 2):
+    // launch-time checksum, run as close as possible to actual kernel
+    // entry (immediately before the real dispatch below) so its result
+    // reflects device memory state at execution time -- offline replay of
+    // a live dump's captured bytes proved CORRECT while the SAME live
+    // call's own output was wrong, meaning a post-hoc dump (captured
+    // AFTER kernel completion) might not be observing what the kernel
+    // actually read. Compare this checksum against a host-side XOR of the
+    // same dump's weight.bin/input.bin: a mismatch localizes a
+    // write-after-read hazard; a match rules that out entirely.
+    if mma_moe && !std::env::var("CEREBRA_MMQ_CHECKSUM").unwrap_or_default().is_empty() {
+        let checksum_func = dev.get_or_load_func("cerebra_mmq_checksum", &candle_kernels::QUANTIZED)?;
+        let checksum_out = dev.alloc_zeros::<u32>(3)?;
+        let input_view_for_checksum: CudaView<u8> = match (&input, &input_quant_owned) {
+            (IndexedMoeInput::Q8_1(view), _) => view.slice(0..y_size_in_bytes),
+            (_, Some(buf)) => buf.slice(0..y_size_in_bytes),
+            _ => unreachable!("non-Q8_1 inputs always build an owned quantize buffer above"),
+        };
+        let weight_len = weight.len() as u32;
+        let input_len = input_view_for_checksum.len() as u32;
+        let ids_count = ids.len() as u32;
+        let mut cs_builder = checksum_func.builder();
+        cs_builder.arg(weight);
+        barg!(cs_builder, weight_len);
+        cs_builder.arg(&input_view_for_checksum);
+        barg!(cs_builder, input_len);
+        cs_builder.arg(ids);
+        barg!(cs_builder, ids_count);
+        cs_builder.arg(&checksum_out);
+        let cs_cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (256, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { cs_builder.launch(cs_cfg) }.w()?;
+        let checksums: Vec<u32> = dev.cuda_stream().memcpy_dtov(&checksum_out).w()?;
+        eprintln!(
+            "cerebra mmq checksum (launch-time, total_tasks={total_tasks}): weight_xor={:#010x} input_xor={:#010x} ids_xor={:#010x}",
+            checksums[0], checksums[1], checksums[2]
+        );
+    }
     if (mmq_moe || mma_moe) && total_tasks > 1024 && input_dim1 == 1 {
         const IMMQ_MAX_TASKS: usize = 1024;
         let chunk_tokens = (IMMQ_MAX_TASKS / topk).max(1);
@@ -888,7 +1126,7 @@ fn indexed_moe_forward_fused_q8_1_input(
             _ => unreachable!("non-Q8_1 inputs always build an owned quantize buffer above"),
         }
         builder.arg(ids);
-        builder.arg(&out);
+        builder.arg(&*out);
 
         barg!(
             builder,
@@ -902,14 +1140,78 @@ fn indexed_moe_forward_fused_q8_1_input(
         unsafe { builder.launch(cfg) }.w()?;
     }
 
+    // Scoped dump (2026-09-01, kona-a0 plan step c): the shape census
+    // (CEREBRA_MMQ_MMA_TRACE) showed the LIVE mma_moe call is the exact
+    // same shape family as the already-verified fix (n=1024 k=2048
+    // k_padded==k input_dim1==1), differing only in total_tasks (96 live
+    // vs 224 in the earlier offline dump) -- ruling out both of kona-a0's
+    // candidate uncovered shapes. Capturing real bytes at THIS smaller
+    // live scale to check whether the bug is task-count-dependent.
+    // Separate env gate (CEREBRA_MMQ_DUMP2) from the removed original
+    // hook so this doesn't collide with any leftover env in the shell.
+    // Broadened (2026-09-01, kona-a0 triangulation step 1) to also fire on
+    // mmq_moe (dp4a) so the SAME live call shape can be captured under the
+    // dp4a tier for a real ground-truth comparison against the mma tier's
+    // output on identical routing/activations -- deterministic dispatch
+    // means the same prompt produces the same ids/activations regardless
+    // of which tier computes the result, since routing happens upstream
+    // of this kernel choice.
+    static DUMPED2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if (mma_moe || mmq_moe)
+        && matches!(w_dtype, GgmlDType::Q4K)
+        && n == 1024
+        && k == 2048
+        && !std::env::var("CEREBRA_MMQ_DUMP2").unwrap_or_default().is_empty()
+        && !DUMPED2.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        use std::io::Write;
+        let dump_dir = std::path::Path::new("/tmp/mmq_dump2");
+        let _ = std::fs::create_dir_all(dump_dir);
+        let dump_stream = dev.cuda_stream();
+        let weight_bytes: Vec<u8> = dump_stream.memcpy_dtov(weight).w()?;
+        let ids_u32: Vec<u32> = dump_stream.memcpy_dtov(ids).w()?;
+        let out_f32: Vec<f32> = dump_stream.memcpy_dtov(&*out).w()?;
+        let input_bytes: Vec<u8> = match (&input, &input_quant_owned) {
+            (IndexedMoeInput::Q8_1(view), _) => dump_stream.memcpy_dtov(view).w()?,
+            (_, Some(buf)) => dump_stream.memcpy_dtov(buf).w()?,
+            _ => unreachable!("non-Q8_1 inputs always build an owned quantize buffer above"),
+        };
+        let meta = format!(
+            "w_dtype={w_dtype:?} num_experts={num_experts} n={n} k={k} batch={batch} topk={topk} \
+             k_padded={k_padded} input_dim1={input_dim1} total_tasks={total_tasks} \
+             weight_bytes={} ids_len={} out_len={} input_bytes={}\n",
+            weight_bytes.len(),
+            ids_u32.len(),
+            out_f32.len(),
+            input_bytes.len()
+        );
+        if let Ok(mut f) = std::fs::File::create(dump_dir.join("meta.txt")) {
+            let _ = f.write_all(meta.as_bytes());
+        }
+        let _ = std::fs::write(dump_dir.join("weight.bin"), &weight_bytes);
+        let _ = std::fs::write(
+            dump_dir.join("ids.bin"),
+            ids_u32.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        let _ = std::fs::write(
+            dump_dir.join("out.bin"),
+            out_f32.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        let _ = std::fs::write(dump_dir.join("input.bin"), &input_bytes);
+        eprintln!("cerebra: mmq dump2 written to /tmp/mmq_dump2 ({meta})");
+    }
+
     let mut out_shape = in_shape.dims().to_vec();
     out_shape.pop();
     out_shape.push(n);
     out_shape[1] = topk;
-    Ok((
-        CudaStorage::wrap_cuda_slice(out, dev.clone()),
-        out_shape.into(),
-    ))
+
+    // Release the storage write-lock before narrowing -- `Tensor::narrow`
+    // reads the storage via its own (shared) lock internally, and holding
+    // the write guard here would deadlock against that.
+    drop(out_storage_guard);
+    let result = entry.out.narrow(0, 0, outsize)?.reshape(out_shape)?;
+    Ok(result)
 }
 
 impl QCudaStorage {
@@ -920,7 +1222,7 @@ impl QCudaStorage {
         input_l: &crate::Layout,
         ids: &CudaStorage, //[batch, topk]
         ids_l: &crate::Layout,
-    ) -> Result<(CudaStorage, crate::Shape)> {
+    ) -> Result<Tensor> {
         if matches!(
             self.dtype(),
             GgmlDType::Q8_0

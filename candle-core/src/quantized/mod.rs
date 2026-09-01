@@ -656,22 +656,24 @@ impl QTensor {
 
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match &self.storage {
+            // Goal-2500 Step 6 alias-bug fix (2026-09-01): `s.indexed_moe_forward`
+            // now returns a `Tensor` directly -- a narrowed view into a
+            // persistent, per-(device,stream) workspace (see that
+            // function's own header comment in cuda.rs for the full
+            // design/safety argument) -- rather than a fresh
+            // `(CudaStorage, Shape)` for this call to wrap via
+            // `crate::tensor::from_storage`. Wrapping a workspace view
+            // through `from_storage` would have been wrong: that path
+            // assumes fresh, independently-owned storage, and the whole
+            // point of the fix is that this storage is shared/reused.
             QStorage::Cuda(s) => match (&*x.storage(), &*ids.storage()) {
-                (Storage::Cuda(x_storage), Storage::Cuda(ids_storage)) => {
-                    let (storage, out_shape) = s.indexed_moe_forward(
-                        self.shape(),
-                        x_storage,
-                        x.layout(),
-                        ids_storage,
-                        ids.layout(),
-                    )?;
-                    Ok(crate::tensor::from_storage(
-                        Storage::Cuda(storage),
-                        out_shape,
-                        crate::op::BackpropOp::none(),
-                        false,
-                    ))
-                }
+                (Storage::Cuda(x_storage), Storage::Cuda(ids_storage)) => s.indexed_moe_forward(
+                    self.shape(),
+                    x_storage,
+                    x.layout(),
+                    ids_storage,
+                    ids.layout(),
+                ),
                 _ => {
                     panic!("Non-cuda indexed_moe_forward is not implemented!");
                 }

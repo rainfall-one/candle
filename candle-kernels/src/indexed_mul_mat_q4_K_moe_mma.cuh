@@ -191,3 +191,58 @@ extern "C" __global__ void indexed_mul_mat_q4_K_moe_mma(
     }
 #undef IMMQ_MMA_MAX_TASKS
 }
+
+// Goal-2500 Step 6 debug instrument (2026-09-01, kona-a0 plan item 2):
+// launch-time checksum. Offline replay of a live dump's exact captured
+// bytes reproduces the CORRECT (dp4a-matching) answer, but the SAME live
+// call's own kernel output is wrong -- meaning either the bytes the
+// kernel actually read at execution time differ from what a later,
+// post-kernel host memcpy observed (a write-after-read hazard a post-hoc
+// dump cannot see), or the launch configuration itself differs in some
+// way not yet identified. This kernel computes a fast parallel XOR
+// checksum over the weight and input buffers using many threads/blocks,
+// launched immediately before the real mma_moe dispatch so its result
+// reflects memory state at the closest possible point to actual kernel
+// entry. Compared against a host-side checksum of the same bytes as
+// captured by the (separate, already-existing) post-hoc dump hook -- a
+// mismatch between the two localizes a write-after-read hazard; a match
+// means the launch config is the remaining suspect.
+extern "C" __global__ void cerebra_mmq_checksum(
+    const uint8_t *__restrict__ weight_bytes,
+    uint32_t weight_len,
+    const uint8_t *__restrict__ input_bytes,
+    uint32_t input_len,
+    const uint32_t *__restrict__ ids_words, // native u32 elements, not raw bytes
+    uint32_t ids_count,
+    uint32_t *__restrict__ out_checksums // [0]=weight xor, [1]=input xor, [2]=ids xor
+) {
+    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+
+    uint32_t w_acc = 0;
+    for (size_t i = tid * 4; i + 4 <= (size_t)weight_len; i += stride * 4) {
+        uint32_t v;
+        memcpy(&v, weight_bytes + i, 4);
+        w_acc ^= v;
+    }
+    if (w_acc != 0) atomicXor(&out_checksums[0], w_acc);
+
+    uint32_t i_acc = 0;
+    for (size_t i = tid * 4; i + 4 <= (size_t)input_len; i += stride * 4) {
+        uint32_t v;
+        memcpy(&v, input_bytes + i, 4);
+        i_acc ^= v;
+    }
+    if (i_acc != 0) atomicXor(&out_checksums[1], i_acc);
+
+    // ids (2026-09-01, kona-a0 item 2): the earlier checksum covered
+    // weight/input but not the task-routing buffer -- if ids is produced
+    // by an async upstream (topk/routing) kernel and mma's launch races
+    // it, the kernel would address the WRONG tasks with otherwise-correct
+    // arithmetic, invisible to a weight/input-only checksum.
+    uint32_t ids_acc = 0;
+    for (size_t i = tid; i < (size_t)ids_count; i += stride) {
+        ids_acc ^= ids_words[i];
+    }
+    if (ids_acc != 0) atomicXor(&out_checksums[2], ids_acc);
+}
