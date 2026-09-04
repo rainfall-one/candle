@@ -4712,6 +4712,66 @@ extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
 #define MOE_GROUPED_MAX_TASKS 1024
 #define MOE_GROUPED_TASK_TILE 8
 
+// Shared task-list builder for the grouped-family kernels (the template
+// below plus the two weight-hoisted _grph variants): cooperative scan of
+// the index list into shared memory, a LOUD truncation tripwire, and a
+// canonicalizing odd-even sort. Added 2026-09-04 (cerebra
+// spec-nondeterminism investigation):
+// - Truncation past the shared list's capacity used to CLAMP silently,
+//   dropping tasks in nondeterministic atomicAdd arrival order with
+//   their output rows never written -- observed live as run-to-run
+//   divergent generation. The host dispatch now chunks every launch to
+//   <= MOE_GROUPED_MAX_TASKS total tasks, so the printf below is
+//   defense-in-depth for any future unchunked caller, not the fix.
+// - The canonicalizing sort is the tiled IMMQ sibling's own 2026-08-30
+//   fix, ported: per-task sums never mix across tasks, but every block
+//   rebuilding its own atomicAdd-ordered permutation makes the task
+//   loop's access order (and any future column-position-keyed change)
+//   silently order-dependent. Sorting by task id gives every block the
+//   identical list.
+// Returns the (possibly clamped) task count for this expert.
+static __device__ __forceinline__ int moe_grouped_build_task_list(
+    const unsigned int * __restrict__ indices,
+    const unsigned int expert_id,
+    const int total_tasks,
+    unsigned short * task_list,
+    int * task_count,
+    const int tid_flat,
+    const int block_threads) {
+    if (tid_flat == 0) {
+        *task_count = 0;
+    }
+    __syncthreads();
+    for (int t = tid_flat; t < total_tasks; t += block_threads) {
+        if (indices[t] == expert_id) {
+            const int slot = atomicAdd(task_count, 1);
+            if (slot < MOE_GROUPED_MAX_TASKS) {
+                task_list[slot] = (unsigned short)t;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid_flat == 0 && *task_count > MOE_GROUPED_MAX_TASKS) {
+        printf("moe_grouped_build_task_list: TRUNCATION expert=%u task_count=%d cap=%d -- "
+               "output is corrupt, host dispatch must chunk this launch\n",
+               expert_id, *task_count, MOE_GROUPED_MAX_TASKS);
+    }
+    const int count = *task_count < MOE_GROUPED_MAX_TASKS ? *task_count : MOE_GROUPED_MAX_TASKS;
+    for (int phase = 0; phase < count; ++phase) {
+        const int start = phase & 1;
+        for (int p = start + 2 * tid_flat; p + 1 < count; p += 2 * block_threads) {
+            const unsigned short a = task_list[p];
+            const unsigned short b = task_list[p + 1];
+            if (a > b) {
+                task_list[p] = b;
+                task_list[p + 1] = a;
+            }
+        }
+        __syncthreads();
+    }
+    return count;
+}
+
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 __device__ void indexed_moe_forward_grouped(
     const void * __restrict__ all_weights,
@@ -4735,20 +4795,9 @@ __device__ void indexed_moe_forward_grouped(
     __shared__ unsigned short task_list[MOE_GROUPED_MAX_TASKS];
     __shared__ int task_count;
     const int tid_flat = (int)threadIdx.y * WARP_SIZE + (int)threadIdx.x;
-    if (tid_flat == 0) {
-        task_count = 0;
-    }
-    __syncthreads();
-    for (int t = tid_flat; t < total_tasks; t += (int)(blockDim.x * blockDim.y)) {
-        if (indices[t] == expert_id) {
-            const int slot = atomicAdd(&task_count, 1);
-            if (slot < MOE_GROUPED_MAX_TASKS) {
-                task_list[slot] = (unsigned short)t;
-            }
-        }
-    }
-    __syncthreads();
-    const int count = task_count < MOE_GROUPED_MAX_TASKS ? task_count : MOE_GROUPED_MAX_TASKS;
+    const int count = moe_grouped_build_task_list(
+        indices, expert_id, total_tasks, task_list, &task_count,
+        tid_flat, (int)(blockDim.x * blockDim.y));
     if (count == 0) {
         return;
     }
@@ -4921,6 +4970,18 @@ static __device__ __forceinline__ void indexed_mul_mat_q_moe(
         }
     }
     __syncthreads();
+    // LOUD truncation tripwire (2026-09-04, cerebra spec-nondeterminism
+    // investigation): the host dispatch chunks every launch to <= 1024
+    // total tasks, so a count past the cap here means an unchunked
+    // caller slipped through -- its dropped tasks' outputs would be
+    // stale memory, in nondeterministic atomicAdd order. Shout instead
+    // of corrupting silently. (See moe_grouped_build_task_list's own
+    // guard for the grouped family's identical treatment.)
+    if (tid_flat == 0 && task_count > IMMQ_MAX_TASKS) {
+        printf("indexed_mul_mat_moe: TRUNCATION expert=%u task_count=%d cap=%d -- "
+               "output is corrupt, host dispatch must chunk this launch\n",
+               expert_id, task_count, IMMQ_MAX_TASKS);
+    }
     const int count = task_count < IMMQ_MAX_TASKS ? task_count : IMMQ_MAX_TASKS;
     if (count == 0) {
         return;
@@ -5210,20 +5271,9 @@ extern "C" __global__ void indexed_moe_forward_q4k_q8_1_grph(
     __shared__ unsigned short task_list[MOE_GROUPED_MAX_TASKS];
     __shared__ int task_count;
     const int tid_flat = (int)threadIdx.y * WARP_SIZE + (int)threadIdx.x;
-    if (tid_flat == 0) {
-        task_count = 0;
-    }
-    __syncthreads();
-    for (int t = tid_flat; t < total_tasks; t += (int)(blockDim.x * blockDim.y)) {
-        if (indices[t] == expert_id) {
-            const int slot = atomicAdd(&task_count, 1);
-            if (slot < MOE_GROUPED_MAX_TASKS) {
-                task_list[slot] = (unsigned short)t;
-            }
-        }
-    }
-    __syncthreads();
-    const int count = task_count < MOE_GROUPED_MAX_TASKS ? task_count : MOE_GROUPED_MAX_TASKS;
+    const int count = moe_grouped_build_task_list(
+        indices, expert_id, total_tasks, task_list, &task_count,
+        tid_flat, (int)(blockDim.x * blockDim.y));
     if (count == 0) {
         return;
     }
@@ -5333,20 +5383,9 @@ extern "C" __global__ void indexed_moe_forward_q5k_q8_1_grph(
     __shared__ unsigned short task_list[MOE_GROUPED_MAX_TASKS];
     __shared__ int task_count;
     const int tid_flat = (int)threadIdx.y * WARP_SIZE + (int)threadIdx.x;
-    if (tid_flat == 0) {
-        task_count = 0;
-    }
-    __syncthreads();
-    for (int t = tid_flat; t < total_tasks; t += (int)(blockDim.x * blockDim.y)) {
-        if (indices[t] == expert_id) {
-            const int slot = atomicAdd(&task_count, 1);
-            if (slot < MOE_GROUPED_MAX_TASKS) {
-                task_list[slot] = (unsigned short)t;
-            }
-        }
-    }
-    __syncthreads();
-    const int count = task_count < MOE_GROUPED_MAX_TASKS ? task_count : MOE_GROUPED_MAX_TASKS;
+    const int count = moe_grouped_build_task_list(
+        indices, expert_id, total_tasks, task_list, &task_count,
+        tid_flat, (int)(blockDim.x * blockDim.y));
     if (count == 0) {
         return;
     }

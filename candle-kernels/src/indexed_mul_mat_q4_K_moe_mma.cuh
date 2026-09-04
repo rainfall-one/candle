@@ -60,6 +60,16 @@ extern "C" __global__ void indexed_mul_mat_q4_K_moe_mma(
         }
     }
     __syncthreads();
+    // LOUD truncation tripwire (2026-09-04) -- same rationale as the
+    // dp4a IMMQ template's guard in quantized.cu: the host dispatch
+    // chunks every launch to <= 1024 total tasks, so a count past the
+    // cap means an unchunked caller slipped through and its dropped
+    // tasks' outputs are stale memory in nondeterministic order.
+    if (tid_flat == 0 && task_count > IMMQ_MMA_MAX_TASKS) {
+        printf("indexed_mul_mat_q4_K_moe_mma: TRUNCATION expert=%u task_count=%d cap=%d -- "
+               "output is corrupt, host dispatch must chunk this launch\n",
+               expert_id, task_count, IMMQ_MMA_MAX_TASKS);
+    }
     const int count = task_count < IMMQ_MMA_MAX_TASKS ? task_count : IMMQ_MMA_MAX_TASKS;
     if (count == 0) {
         return;

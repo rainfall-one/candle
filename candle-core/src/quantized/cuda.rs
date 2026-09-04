@@ -1067,17 +1067,32 @@ fn indexed_moe_forward_fused_q8_1_input(
     // [batch, topk] rows -- trivially correct (chunks never touch each
     // other's ids/input/output regions, and every chunk computes
     // exactly what a smaller standalone call over that row range would).
-    // Only valid for `input_dim1 == 1` (one activation row per token,
-    // routed to `topk` experts) -- the shape every current Cerebra
-    // caller uses, both decode and prefill: chunk boundaries land on
-    // whole TOKEN rows, which only lines up with whole TASK boundaries
-    // (`token_start * topk`) when each token owns exactly one row. A
-    // caller using `input_dim1 == topk` (one row per task) is not
-    // chunked here -- none of Cerebra's callers do, and a wrong
-    // assumption there would corrupt silently, so it falls through to
-    // the single-shot path below (correct, just not chunked -- it would
-    // only be reached with total_tasks <= 1024 in practice since no
-    // such caller exists yet).
+    // Two chunkable shapes, each with its own boundary rule:
+    // - `input_dim1 == 1` (one activation row per token, routed to
+    //   `topk` experts): chunk boundaries must land on whole TOKEN rows
+    //   (`token_start * topk`) -- the first arm below.
+    // - `input_dim1 == topk` (one activation row per TASK): chunk
+    //   boundaries are per-task, strictly simpler (slice ids/input/out
+    //   at task granularity; each chunk relaunches as its own
+    //   `(batch = chunk_tasks, topk = 1, input_dim1 = 1)` problem,
+    //   which the kernel's own indexing makes literally identical:
+    //   `input_row = t / 1 = t`, ids and outputs are flat per-task
+    //   arrays either way) -- the second arm below.
+    // HISTORY (2026-09-04, cerebra-spec-nondeterminism investigation):
+    // an earlier version of this comment claimed no `input_dim1 != 1`
+    // caller exists and let that shape fall through to the single-shot
+    // launch. The DOWN projection (`QuantizedExperts::weighted_sum`'s
+    // `[seq, top_k, intermediate]` input) is exactly such a caller, and
+    // at prefill task counts its unchunked launch overflowed the
+    // kernel's 1024-entry per-expert shared task list -- silently
+    // truncated in atomicAdd arrival order (nondeterministic dropped
+    // tasks, their output rows never written). Confirmed live via
+    // dtype bisect: CEREBRA_MOE_GROUPED=q6k (down projection only)
+    // diverged 3 modes in 4 identical runs; =q4k (gate_up only,
+    // token-chunked) was 4/4 bit-identical. Any OTHER over-cap shape
+    // now fails loudly instead of corrupting. Per-task chunking also
+    // removes the `unsigned short` task-id overflow any unchunked
+    // launch past 65,535 tasks would have hit inside the kernel.
     // Goal-2500 Step 6 (2026-09-01): the mma tier routes through this
     // SAME loop, not a second chunking path -- `func`/`cfg` are already
     // tier-dispatched above, so this loop just launches whichever kernel
@@ -1167,6 +1182,65 @@ fn indexed_moe_forward_fused_q8_1_input(
 
             token_start += chunk_batch;
         }
+    } else if (mmq_moe || mma_moe) && total_tasks > 1024 && input_dim1 == topk {
+        // Per-task chunking for the one-row-per-TASK shape (the down
+        // projection's `[batch, topk, k]` input) -- see the boundary-rule
+        // comment above. Each chunk is a complete, independent launch
+        // over a contiguous task range, re-expressed as its own
+        // `(batch = chunk_tasks, topk = 1, input_dim1 = 1)` problem:
+        // in-kernel `input_row = t / topk` becomes `t / 1 = t`, exactly
+        // the per-task row this shape stores, and ids/output indexing is
+        // flat per-task in both formulations. No chunk can exceed the
+        // kernel's IMMQ_MAX_TASKS (1024) shared task list, restoring the
+        // list's no-truncation precondition for every launch.
+        const IMMQ_MAX_TASKS: usize = 1024;
+        let input_view: CudaView<u8> = match (&input, &input_quant_owned) {
+            (IndexedMoeInput::Q8_1(view), _) => view.slice(0..y_size_in_bytes),
+            (_, Some(buf)) => buf.slice(0..y_size_in_bytes),
+            _ => unreachable!("non-Q8_1 inputs always build an owned quantize buffer above"),
+        };
+        let mut task_start = 0usize;
+        while task_start < total_tasks {
+            let chunk_tasks = IMMQ_MAX_TASKS.min(total_tasks - task_start);
+
+            let input_chunk = input_view.slice(
+                task_start * dst_row_size_bytes..(task_start + chunk_tasks) * dst_row_size_bytes,
+            );
+            let ids_chunk = ids.slice(task_start..task_start + chunk_tasks);
+            let out_chunk = out.slice(task_start * n..(task_start + chunk_tasks) * n);
+
+            let mut builder = func.builder();
+            builder.arg(weight);
+            builder.arg(&input_chunk);
+            builder.arg(&ids_chunk);
+            builder.arg(&out_chunk);
+            barg!(
+                builder,
+                n as i32,
+                k as i32,
+                chunk_tasks as i32, // batch
+                1i32,               // topk
+                k_padded as i32,
+                1i32 // input_dim1
+            );
+            unsafe { builder.launch(cfg) }.w()?;
+
+            task_start += chunk_tasks;
+        }
+    } else if (mmq_moe || mma_moe) && total_tasks > 1024 {
+        // Neither chunkable shape -- refuse loudly rather than launch a
+        // kernel whose 1024-entry shared task list would silently
+        // truncate in nondeterministic atomicAdd order (the exact
+        // corruption the 2026-09-04 investigation root-caused). No
+        // current caller reaches this arm; if a future shape does, it
+        // needs its own chunk-boundary rule added above, not a silent
+        // fallthrough.
+        crate::bail!(
+            "indexed_moe_forward: total_tasks={total_tasks} exceeds the tiled MMQ kernel's \
+             1024-task shared list and input_dim1={input_dim1} matches neither chunkable shape \
+             (1 or topk={topk}) -- refusing the unchunked launch, which would silently drop \
+             tasks in nondeterministic order"
+        );
     } else {
         let mut builder = func.builder();
         builder.arg(weight);
