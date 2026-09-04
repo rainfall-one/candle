@@ -4556,7 +4556,7 @@ __device__ void indexed_moe_forward_warp_rows(
     }
 }
 
-extern "C" __global__ void indexed_moe_forward_q4k_q8_1_wr(
+extern "C" __global__ void __launch_bounds__(128, 16) indexed_moe_forward_q4k_q8_1_wr(
     const void * __restrict__ all_weights,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
@@ -4571,7 +4571,7 @@ extern "C" __global__ void indexed_moe_forward_q4k_q8_1_wr(
         (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
 }
 
-extern "C" __global__ void indexed_moe_forward_q5k_q8_1_wr(
+extern "C" __global__ void __launch_bounds__(128, 16) indexed_moe_forward_q5k_q8_1_wr(
     const void * __restrict__ all_weights,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
@@ -4586,7 +4586,7 @@ extern "C" __global__ void indexed_moe_forward_q5k_q8_1_wr(
         (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
 }
 
-extern "C" __global__ void indexed_moe_forward_q6k_q8_1_wr(
+extern "C" __global__ void __launch_bounds__(128, 16) indexed_moe_forward_q6k_q8_1_wr(
     const void * __restrict__ all_weights,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
