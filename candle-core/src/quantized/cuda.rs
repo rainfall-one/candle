@@ -43,6 +43,36 @@ fn pad(p: usize, q: usize) -> usize {
     ceil_div(p, q) * q
 }
 
+/// Task-count floor for the tiled dp4a MMQ tier's DEFAULT dispatch
+/// (Goal-2500 enablement, 2026-09-05): real hardware evidence shows this
+/// tier wins at prefill scale (~20k tasks, -31 to -45% TTFT/MoE-time)
+/// but REGRESSES at decode widths (64-256 tasks, -7.9% to -17.6% decode
+/// tok/s) -- the per-launch task-list scan+sort cost this tier's own
+/// `moe_grouped_build_task_list`-family helper pays doesn't amortize
+/// below some real task count. 1,024 sits above every decode width
+/// measured (<=256 tasks even at N=32) and below every prefill chunk
+/// (4,096 tasks) -- comfortably inside the gap between the two
+/// evidenced regimes, not derived from a sweep of the boundary itself.
+///
+fn moe_grouped_min_tasks() -> usize {
+    moe_grouped_min_tasks_from_raw(std::env::var("CEREBRA_MOE_GROUPED_MIN_TASKS").ok().as_deref())
+}
+
+/// Pure half of [`moe_grouped_min_tasks`] -- unit-testable without
+/// mutating the process environment (this file's CUDA tests run
+/// against real hardware; splitting the parse out keeps this predicate
+/// testable on any machine, no device required).
+///
+/// # Errors
+/// Never -- an unparsable or zero override falls back to the default
+/// rather than propagating, matching this crate's own env-override
+/// conventions elsewhere (an operator typo should not crash inference).
+fn moe_grouped_min_tasks_from_raw(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(1024)
+}
+
 fn quantize_q8_1(
     src: &CudaView<f32>,
     dst: &mut CudaSlice<u8>,
@@ -850,6 +880,13 @@ fn indexed_moe_forward_fused_q8_1_input(
     // (1024) below -- kept as its own gate, untouched, still bounded at
     // 1024 tasks total (never chunked; Q8_0 experts are not Cerebra's
     // hot MoE dtypes and this path is off by default regardless).
+    //
+    // Deliberately NOT given the task-count-driven default treatment
+    // `mmq_moe` gets below (2026-09-05 enablement) -- this is the naive
+    // expert-major register-tile kernel, MEASURED NULL at every decode
+    // width tested (see the comment a few lines up), a confirmed dead
+    // end kept only for override-driven experimentation, not a
+    // candidate for any production default at any task count.
     let grouped = !std::env::var("CEREBRA_MOE_GROUPED").unwrap_or_default().is_empty()
         && total_tasks > 32
         && total_tasks <= 1024
@@ -863,19 +900,6 @@ fn indexed_moe_forward_fused_q8_1_input(
     // per-task vec_dot kernels (rounds 1/2, kept below for Q6K/Q8_0)
     // could not reach. Grid: (row_tiles, col_tile_stride, experts),
     // block (32, IMMQ_NWARPS).
-    // Bisect switch: CEREBRA_MOE_GROUPED=1 -> MMQ for both hot dtypes;
-    // =q4k / =q5k -> MMQ for that dtype only (the other stays
-    // task-major) -- correctness bisection for the tiled path.
-    let moe_grouped_env = std::env::var("CEREBRA_MOE_GROUPED").unwrap_or_default();
-    let mmq_eligible_dtype = match w_dtype {
-        GgmlDType::Q4K => moe_grouped_env == "1" || moe_grouped_env == "q4k",
-        GgmlDType::Q5K => moe_grouped_env == "1" || moe_grouped_env == "q5k",
-        // Step 2 of the Goal-2500 campaign (2026-08-30): Q6K down
-        // projections through the same tiled MMQ path. "q6k" bisects
-        // independently of Q4K/Q5K for correctness isolation.
-        GgmlDType::Q6K => moe_grouped_env == "1" || moe_grouped_env == "q6k",
-        _ => false,
-    };
     // Goal-2500 Step 7.5 (2026-08-31): NO upper bound on total_tasks here
     // (unlike `grouped` above) -- prefill's total_tasks (seq_len x topk,
     // e.g. ~20,000 at a 2.5k-token prompt) blew past both the old
@@ -889,7 +913,52 @@ fn indexed_moe_forward_fused_q8_1_input(
     // needs to reject large counts -- it always routes MMQ-eligible
     // dtypes through MMQ when the row-major (`input_dim1 == 1`)
     // precondition chunking needs holds (checked at the call site).
-    let mmq_moe = total_tasks > 32 && mmq_eligible_dtype;
+    //
+    // Enablement (2026-09-05): the `total_tasks > 32` flat gate above
+    // is RETIRED as the tier's authoritative condition -- it applied
+    // the SAME threshold at every scale, which is exactly what made a
+    // real prefill win (Single's TTFT A/B: -31 to -45%) coexist with a
+    // real decode-width regression (this session's ladder: N=4/8/16 at
+    // -17.6%/-13.8%/-7.9% decode tok/s) behind one boolean. The tier now
+    // engages by TASK COUNT: default ON once `total_tasks` reaches
+    // `moe_grouped_min_tasks()` (1,024 by default -- see that function's
+    // own doc), no env needed. `CEREBRA_MOE_GROUPED` stays as a pure
+    // force-override for experiments: "1" forces every hot dtype on at
+    // ANY task count (what this session's own decode-width measurement
+    // used); a specific dtype string ("q4k"/"q5k"/"q6k") forces ONLY
+    // that dtype on and EXCLUDES the others regardless of task count --
+    // unchanged correctness-bisection semantics from before, just no
+    // longer the production default path.
+    let moe_grouped_env = std::env::var("CEREBRA_MOE_GROUPED").unwrap_or_default();
+    let task_count_gate = total_tasks >= moe_grouped_min_tasks();
+    let mmq_eligible_dtype = match w_dtype {
+        GgmlDType::Q4K => match moe_grouped_env.as_str() {
+            "" => task_count_gate,
+            "1" => true,
+            "q4k" => true,
+            "q5k" | "q6k" => false,
+            _ => task_count_gate,
+        },
+        GgmlDType::Q5K => match moe_grouped_env.as_str() {
+            "" => task_count_gate,
+            "1" => true,
+            "q5k" => true,
+            "q4k" | "q6k" => false,
+            _ => task_count_gate,
+        },
+        // Step 2 of the Goal-2500 campaign (2026-08-30): Q6K down
+        // projections through the same tiled MMQ path. "q6k" bisects
+        // independently of Q4K/Q5K for correctness isolation.
+        GgmlDType::Q6K => match moe_grouped_env.as_str() {
+            "" => task_count_gate,
+            "1" => true,
+            "q6k" => true,
+            "q4k" | "q5k" => false,
+            _ => task_count_gate,
+        },
+        _ => false,
+    };
+    let mmq_moe = mmq_eligible_dtype;
     // Goal-2500 Step 6 (2026-09-01): tensor-core int8 mma MMQ, THIRD tier
     // ahead of the dp4a mmq_moe tier -- CEREBRA_MMQ_MMA=1 selects it, and
     // ONLY for Q4K (M1's dtype; Q5K/Q6K land in M4). Non-Q4K dtypes and
@@ -1737,6 +1806,45 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// [Unit] Enablement (2026-09-05): the default threshold is 1,024
+    /// when no override is set, matching the real gap between every
+    /// decode width measured (<=256 tasks) and every prefill chunk
+    /// (4,096 tasks) -- and an unparsable or zero override falls back
+    /// to that default rather than propagating or panicking.
+    #[test]
+    fn unit_moe_grouped_min_tasks_default_and_override() {
+        assert_eq!(moe_grouped_min_tasks_from_raw(None), 1024);
+        assert_eq!(moe_grouped_min_tasks_from_raw(Some("512")), 512);
+        assert_eq!(moe_grouped_min_tasks_from_raw(Some("not-a-number")), 1024);
+        assert_eq!(moe_grouped_min_tasks_from_raw(Some("0")), 1024);
+    }
+
+    /// [Regression] Enablement (2026-09-05), the predicate this PR's
+    /// whole change rests on: a call at a decode-width task count
+    /// (measured up to 256 tasks at N=32) must NOT default-engage the
+    /// tiled MMQ tier, while a call at prefill-chunk scale (4,096 tasks)
+    /// must. Named after the real hardware finding (decode-width
+    /// regression, prefill-scale win) this threshold exists to
+    /// separate.
+    #[test]
+    fn regression_task_count_gate_separates_decode_from_prefill_scale() {
+        let min_tasks = moe_grouped_min_tasks_from_raw(None);
+        let decode_width_n32_tasks = 32 * 8; // N=32, topk=8 -- this session's own ladder
+        let prefill_chunk_tasks = 4096;
+        assert!(
+            decode_width_n32_tasks < min_tasks,
+            "decode-width task count ({decode_width_n32_tasks}) must sit below the default \
+             threshold ({min_tasks}), or the tier would default-engage at exactly the width \
+             measured as a regression"
+        );
+        assert!(
+            prefill_chunk_tasks >= min_tasks,
+            "a prefill chunk ({prefill_chunk_tasks} tasks) must clear the default threshold \
+             ({min_tasks}), or the tier would default-engage at the scale it was originally \
+             a measured, real win"
+        );
+    }
 
     #[test]
     fn cuda_quantize_q8_1() -> Result<()> {
