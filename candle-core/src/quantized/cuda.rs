@@ -993,6 +993,29 @@ fn indexed_moe_forward_fused_q8_1_input(
         && !mma_moe
         && moe_grouped_env == "1"
         && matches!(w_dtype, GgmlDType::Q8_0);
+    // Dispatch trace (2026-09-05, CEREBRA_MOE_TIER_TRACE=1): prints the
+    // resolved tier for every indexed-MoE call -- the precedence-audit
+    // instrument for the task-count-gate enablement above. Cheap enough
+    // to leave in permanently behind the env gate, same convention as
+    // CEREBRA_MMQ_MMA_TRACE/CEREBRA_GRAPH_NODE_AUDIT elsewhere in this
+    // file.
+    if !std::env::var("CEREBRA_MOE_TIER_TRACE").unwrap_or_default().is_empty() {
+        let tier = if mma_moe {
+            "mma_moe"
+        } else if mmq_moe {
+            "mmq_moe"
+        } else if grp_family {
+            "grp_family"
+        } else {
+            "task_major"
+        };
+        eprintln!(
+            "cerebra moe_tier_trace: tier={tier} w_dtype={w_dtype:?} total_tasks={total_tasks} \
+             task_count_gate={task_count_gate} moe_grouped_env={moe_grouped_env:?} \
+             min_tasks={}",
+            moe_grouped_min_tasks()
+        );
+    }
     // Per-device geometry (never hardcode for one card): both compiled
     // tile shapes are runtime-selectable. CEREBRA_MMQ_GEOM=y64 picks
     // the fatter (8, 64, 8) row tiles; the default y32 (8, 32, 4) is
