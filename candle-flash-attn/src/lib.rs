@@ -246,6 +246,250 @@ impl candle::CustomOp3 for FlashAttn {
     }
 }
 
+// Alias-bug fix (2026-09-05, second instance of the ca89ad37 defect
+// class -- see that commit's own header comment in
+// `candle-core/src/quantized/cuda.rs` for the full root-cause writeup):
+// this fork's `cuMemAllocAsync` pool allocator is unreliable on the
+// A100-40GB/VMware-passthrough/driver-610.57.04/CUDA-13.3.1 combination
+// -- a kernel's own scatter-write into a freshly-cycled pool buffer can
+// silently receive wrong data. `FlashAttn::cuda_fwd_t` (above) allocates
+// its `dst` output fresh on every call via `unsafe { dev.alloc }`,
+// exactly the pattern `ca89ad37` fixed for `indexed_moe_forward`.
+//
+// Two different fixes for the two different buffers here, because they
+// have different ownership shapes:
+//
+// `dst` (the real output, returned to the caller): CANNOT use `ca89ad37`'s
+// own workspace trick directly -- that trick works by having the callER
+// see a `Tensor::narrow()` VIEW into a persistent Arc<Storage>, which
+// requires the call site to go through `Tensor`-level ops, not
+// `CustomOp3::cuda_fwd`'s fixed `Result<(CudaStorage, Shape)>` return
+// type (a raw `CudaStorage` handed out fresh every call, by the trait's
+// own contract, has no non-owning-view story). Fix here instead: `out`
+// is now the CALLER's own responsibility -- [`flash_attn_into`] writes
+// directly into a `Tensor` the caller allocates ONCE and reuses across
+// calls (exactly the persistent-buffer principle, just relocated to
+// where the ownership already naturally lives). [`flash_attn`] keeps its
+// existing behavior unchanged (allocates fresh every call via the
+// existing `cuda_fwd_t`/`CustomOp3` path) -- this is an ADDITIVE API,
+// not a change to the default one.
+//
+// `softmax_lse` (an internal scratch buffer this crate's own callers
+// never read): DOES use `ca89ad37`'s exact workspace pattern -- a
+// persistent, per-(device,stream) `CudaSlice<f32>`, grown-not-shrunk,
+// reused across every call. This mirrors that commit's own treatment of
+// MoE's `input_quant` scratch buffer ("stays a raw persistent
+// CudaSlice<u8>, never returned to the caller, no ownership conflict to
+// solve") -- the identical situation here.
+struct FlashLseWorkspaceEntry {
+    lse: candle::cuda_backend::cudarc::driver::CudaSlice<f32>,
+    capacity: usize, // f32 elements
+}
+
+type FlashLseWorkspaceKey = (candle::cuda_backend::DeviceId, usize);
+
+static FLASH_LSE_WORKSPACE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<FlashLseWorkspaceKey, FlashLseWorkspaceEntry>>,
+> = std::sync::OnceLock::new();
+
+fn flash_lse_workspace_key(dev: &candle::CudaDevice) -> FlashLseWorkspaceKey {
+    let stream_ptr = std::sync::Arc::as_ptr(&dev.cuda_stream()) as usize;
+    (dev.id(), stream_ptr)
+}
+
+/// Ensures a persistent `softmax_lse` scratch buffer exists for `dev`'s
+/// (device, stream) key with capacity for at least `elems` f32 elements,
+/// growing (never shrinking) if the existing entry -- or lack of one --
+/// is too small. Returns the entry's key so the caller can look it back
+/// up under the same lock scope needed for the actual kernel dispatch.
+fn flash_lse_workspace_ensure(dev: &candle::CudaDevice, elems: usize) -> Result<FlashLseWorkspaceKey> {
+    let key = flash_lse_workspace_key(dev);
+    let map_lock = FLASH_LSE_WORKSPACE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = map_lock.lock().expect("flash lse workspace mutex poisoned");
+    let needs_alloc = match map.get(&key) {
+        Some(entry) => entry.capacity < elems,
+        None => true,
+    };
+    if needs_alloc {
+        let prior_cap = map.get(&key).map(|e| e.capacity).unwrap_or(0);
+        let new_cap = elems.max(prior_cap);
+        let lse = dev.alloc_zeros::<f32>(new_cap)?;
+        map.insert(key, FlashLseWorkspaceEntry { lse, capacity: new_cap });
+    }
+    Ok(key)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flash_attn_into_t<T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr>(
+    q: &candle::CudaStorage,
+    q_l: &Layout,
+    k: &candle::CudaStorage,
+    k_l: &Layout,
+    v: &candle::CudaStorage,
+    v_l: &Layout,
+    out: &candle::CudaStorage,
+    out_l: &Layout,
+    is_bf16: bool,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<()> {
+    let dev = q.device();
+    let q_slice = q.as_cuda_slice::<T>()?;
+    let k_slice = k.as_cuda_slice::<T>()?;
+    let v_slice = v.as_cuda_slice::<T>()?;
+    let dst_slice = out.as_cuda_slice::<T>()?;
+    let q_slice = q_slice.slice(q_l.start_offset()..);
+    let k_slice = k_slice.slice(k_l.start_offset()..);
+    let v_slice = v_slice.slice(v_l.start_offset()..);
+    let dst_slice = dst_slice.slice(out_l.start_offset()..);
+
+    let q_stride = q_l.stride();
+    let k_stride = k_l.stride();
+    let v_stride = v_l.stride();
+    let o_stride = out_l.stride();
+
+    let q_rank = q_stride.len();
+    let k_rank = k_stride.len();
+    let v_rank = v_stride.len();
+    let o_rank = o_stride.len();
+
+    if q_rank != 4 || k_rank != 4 || v_rank != 4 {
+        candle::bail!("flash-attn-into expects input tensors of rank 4 (q: {q_rank}, k: {k_rank}, v: {v_rank}")
+    }
+    if q_stride[q_rank - 1] != 1 {
+        candle::bail!("the last dim of q must be contiguous {q_stride:?}")
+    }
+    if k_stride[k_rank - 1] != 1 {
+        candle::bail!("the last dim of k must be contiguous {k_stride:?}")
+    }
+    if v_stride[v_rank - 1] != 1 {
+        candle::bail!("the last dim of v must be contiguous {v_stride:?}")
+    }
+
+    let (b_sz, seqlen_q, num_heads, head_size_og) = q_l.shape().dims4()?;
+    let (_b_sz, seqlen_k, num_heads_k, _head_size_og) = k_l.shape().dims4()?;
+    let expected_kv = (b_sz, seqlen_k, num_heads_k, head_size_og);
+    if expected_kv != k_l.shape().dims4()? {
+        candle::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
+    }
+    if expected_kv != v_l.shape().dims4()? {
+        candle::bail!("shape mismatch q {:?} and v {:?}", q_l.shape(), v_l.shape())
+    }
+    if out_l.shape().dims4()? != (b_sz, seqlen_q, num_heads, head_size_og) {
+        candle::bail!(
+            "flash-attn-into: out shape {:?} does not match q shape {:?}",
+            out_l.shape(),
+            q_l.shape()
+        )
+    }
+    if head_size_og > 512 {
+        candle::bail!("only supports head dimension at most 512 (got {head_size_og})")
+    }
+    if head_size_og % 8 != 0 {
+        candle::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
+    }
+    if num_heads % num_heads_k != 0 {
+        candle::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
+    }
+
+    let stream = dev.cuda_stream();
+
+    let head_size = round_multiple(head_size_og, 8);
+    let head_size_rounded = round_multiple(head_size, 32);
+    let seqlen_q_rounded = round_multiple(seqlen_q, 128);
+    let seqlen_k_rounded = round_multiple(seqlen_k, 128);
+
+    // Persistent softmax_lse workspace (see this module's own header
+    // comment) instead of a fresh `dev.alloc_zeros` every call.
+    let lse_elems = b_sz * 128 * num_heads * seqlen_q;
+    let lse_key = flash_lse_workspace_ensure(dev, lse_elems)?;
+    let lse_map_lock = FLASH_LSE_WORKSPACE.get().expect("just ensured above");
+    let lse_map = lse_map_lock.lock().expect("flash lse workspace mutex poisoned");
+    let lse_entry = lse_map.get(&lse_key).expect("just ensured above");
+
+    let is_causal = if causal { 1 } else { 0 };
+    let (window_size_left, window_size_right): (i32, i32) = if causal { (-1, 0) } else { (-1, -1) };
+
+    unsafe {
+        let (q_ptr, _guard) = q_slice.device_ptr(&stream);
+        let (k_ptr, _guard) = k_slice.device_ptr(&stream);
+        let (v_ptr, _guard) = v_slice.device_ptr(&stream);
+        let (dst_ptr, _guard) = dst_slice.device_ptr(&stream);
+        let (softmax_lse_ptr, _guard) = lse_entry.lse.device_ptr(&stream);
+        ffi::run_mha(
+            q_ptr as *const core::ffi::c_void,
+            k_ptr as *const core::ffi::c_void,
+            v_ptr as *const core::ffi::c_void,
+            dst_ptr as *const core::ffi::c_void,
+            softmax_lse_ptr as *const core::ffi::c_void,
+            /* alibi_slopes_ptr */ std::ptr::null(),
+            /* cu_seqlens_q_ptr */ std::ptr::null(),
+            /* cu_seqlens_k_ptr */ std::ptr::null(),
+            /* q_batch_stride */ q_stride[0] as u32,
+            /* k_batch_stride */ k_stride[0] as u32,
+            /* v_batch_stride */ v_stride[0] as u32,
+            /* o_batch_stride */ o_stride[0] as u32,
+            /* alibi_slopes_batch_stride */ 0,
+            /* q_row_stride   */ q_stride[q_rank - 3] as u32,
+            /* k_row_stride   */ k_stride[k_rank - 3] as u32,
+            /* v_row_stride   */ v_stride[v_rank - 3] as u32,
+            /* o_row_stride   */ o_stride[o_rank - 3] as u32,
+            /* q_head_stride  */ q_stride[q_rank - 2] as u32,
+            /* k_head_stride  */ k_stride[k_rank - 2] as u32,
+            /* v_head_stride  */ v_stride[v_rank - 2] as u32,
+            /* o_head_stride  */ o_stride[o_rank - 2] as u32,
+            /* b */ b_sz as u32,
+            /* h */ num_heads as u32,
+            /* h_k */ num_heads_k as u32,
+            /* d */ head_size as u32,
+            /* d_rounded */ head_size_rounded as u32,
+            /* softmax_scale*/ softmax_scale,
+            /* seqlen_q */ seqlen_q as u32,
+            /* seqlen_k */ seqlen_k as u32,
+            /* seqlen_q_rounded */ seqlen_q_rounded as u32,
+            /* seqlen_k_rounded */ seqlen_k_rounded as u32,
+            /* is_bf16 */ if is_bf16 { 1 } else { 0 },
+            /* is_causal */ is_causal,
+            /* upadded_lse */ 0,
+            /* window_size_left */ window_size_left,
+            /* window_size_right */ window_size_right,
+            /* softcap */ 0f32,
+        )
+    }
+    Ok(())
+}
+
+/// Flash-attention v2, writing directly into a CALLER-OWNED `out` tensor
+/// instead of allocating a fresh output every call -- see this module's
+/// own header comment for why (the `ca89ad37`-class `cuMemAllocAsync`
+/// alias defect). `out` must be shape `(batch, seqlen_q, num_heads_q,
+/// head_size)`, same dtype as `q` (f16 or bf16), and is the CALLER's
+/// responsibility to allocate once and keep alive across calls -- this
+/// function performs zero allocation of its own for the output (the
+/// internal `softmax_lse` scratch buffer, never exposed to the caller,
+/// still uses a persistent per-(device,stream) workspace internally).
+///
+/// # Errors
+/// Any shape/stride/dtype mismatch between `q`/`k`/`v`/`out`, or a
+/// `candle_core`/CUDA driver error from the underlying kernel launch.
+pub fn flash_attn_into(q: &Tensor, k: &Tensor, v: &Tensor, out: &Tensor, softmax_scale: f32, causal: bool) -> Result<()> {
+    let (q_storage, q_l) = q.storage_and_layout();
+    let (k_storage, k_l) = k.storage_and_layout();
+    let (v_storage, v_l) = v.storage_and_layout();
+    let (out_storage, out_l) = out.storage_and_layout();
+    let (q_storage, k_storage, v_storage, out_storage) = match (&*q_storage, &*k_storage, &*v_storage, &*out_storage) {
+        (candle::Storage::Cuda(q), candle::Storage::Cuda(k), candle::Storage::Cuda(v), candle::Storage::Cuda(o)) => {
+            (q, k, v, o)
+        }
+        _ => candle::bail!("flash_attn_into requires all of q/k/v/out to be CUDA tensors"),
+    };
+    match q.dtype() {
+        DType::F16 => flash_attn_into_t::<f16>(q_storage, q_l, k_storage, k_l, v_storage, v_l, out_storage, out_l, false, softmax_scale, causal),
+        DType::BF16 => flash_attn_into_t::<bf16>(q_storage, q_l, k_storage, k_l, v_storage, v_l, out_storage, out_l, true, softmax_scale, causal),
+        dt => candle::bail!("flash-attn-into is only supported for f16/bf16 ({dt:?})"),
+    }
+}
+
 /// Flash-attention v2 layer.
 ///
 /// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
@@ -266,17 +510,16 @@ pub fn flash_attn(
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Tensor> {
-    let window_size_left = None;
-    let window_size_right = if causal { Some(0) } else { None };
-
-    let op = FlashAttn {
-        softmax_scale,
-        alibi_slopes: None,
-        window_size_left,
-        window_size_right,
-        softcap: None,
-    };
-    q.apply_op3(k, v, op)
+    // Thin wrapper (2026-09-05, see `flash_attn_into`'s own header
+    // comment for why): allocates a fresh output tensor, same as this
+    // function's own previous behavior, then writes into it via the
+    // alias-defect-safe path. `flash_attn`'s own signature has no
+    // alibi/windowing parameters, so `flash_attn_into`'s plain
+    // causal-only support is a complete, faithful match -- no
+    // functionality lost for this specific entry point.
+    let out = Tensor::zeros(q.shape(), q.dtype(), q.device())?;
+    flash_attn_into(q, k, v, &out, softmax_scale, causal)?;
+    Ok(out)
 }
 
 /// Flash-attention v2 layer.
