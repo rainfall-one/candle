@@ -841,6 +841,68 @@ impl CudaDevice {
         self.context.mem_get_info().w()
     }
 
+    /// Bytes this device's default `cuMemAllocAsync` pool currently holds
+    /// reserved for fast reuse but is not actively lending to a live
+    /// allocation right now: `RESERVED_MEM_CURRENT - USED_MEM_CURRENT` on
+    /// the pool `cuDeviceGetDefaultMemPool` returns.
+    ///
+    /// Rainfall-fork addition (2026-09-05, kona#4369): `mem_get_info`'s
+    /// driver-visible free bytes do NOT include this pool-held headroom --
+    /// a pool-backed allocator (the default when
+    /// `CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED` and
+    /// `CUDARC_DISABLE_ASYNC_ALLOC` is unset) keeps freed allocations
+    /// reserved for fast stream-ordered reuse rather than returning them
+    /// to the driver immediately, so a caller that reads ONLY
+    /// `mem_get_info` under-counts what a same-or-smaller-shaped
+    /// allocation could actually reuse for free, right now, with no new
+    /// driver allocation at all. A caller doing its own admission-style
+    /// headroom accounting should add this to `mem_get_info`'s free count,
+    /// not replace it -- the pool can only serve requests up to its own
+    /// reserved size; anything beyond that still needs real driver-level
+    /// free memory.
+    ///
+    /// Returns `0` when this context has no async allocator
+    /// (`CudaContext::has_async_alloc` is `false` -- either the device
+    /// lacks pool support, or `CUDARC_DISABLE_ASYNC_ALLOC` forced
+    /// `cuMemAlloc`/`cuMemFree` for this whole process, see that flag's
+    /// own doc comment above `CudaContext::has_async_alloc`): there is no
+    /// pool to query in that case, and `0` is the fully-conservative,
+    /// always-correct answer for "how much would querying the pool add."
+    ///
+    /// Deliberately does NOT trim the pool (`cuMemPoolTrimTo`) -- this is
+    /// a pure read. Trimming would return this same reusable memory to
+    /// the driver, but the NEXT allocation of a similar shape would then
+    /// have to pay the real allocation cost again instead of reusing it;
+    /// a caller wanting the pool's memory back for a DIFFERENT purpose is
+    /// a distinct, explicit decision this method does not make on its
+    /// own.
+    pub fn mem_pool_reusable_bytes(&self) -> Result<usize> {
+        if !self.context.has_async_alloc() {
+            return Ok(0);
+        }
+        use cudarc::driver::{result, sys};
+        let pool = unsafe { result::device::get_default_mem_pool(self.context.cu_device()) }.w()?;
+        let mut reserved: u64 = 0;
+        let mut used: u64 = 0;
+        unsafe {
+            result::mem_pool::get_attribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+                std::ptr::addr_of_mut!(reserved).cast(),
+            )
+        }
+        .w()?;
+        unsafe {
+            result::mem_pool::get_attribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                std::ptr::addr_of_mut!(used).cast(),
+            )
+        }
+        .w()?;
+        Ok(reserved.saturating_sub(used) as usize)
+    }
+
     /// When turned on, all cuda tensors **created after calling this function** will
     /// not track uses via cuda events.
     ///
@@ -1880,6 +1942,83 @@ mod htod_info_cache_tests {
         let data = [7, 9, 11];
         let uploaded = dev.clone_htod_capture_safe(&data).expect("plain-path upload");
         assert_eq!(uploaded.len(), data.len());
+    }
+}
+
+#[cfg(test)]
+mod mem_pool_reusable_bytes_tests {
+    use super::{BackendDevice, CudaDevice};
+
+    /// [Unit, ignored without a real GPU] `kona#4369` regression: allocate
+    /// and drop a 256 MiB tensor, then confirm `mem_pool_reusable_bytes`
+    /// reports at least that much reusable headroom -- the exact shape of
+    /// the admission-headroom fix this method exists for (a caller adding
+    /// this to `mem_get_info`'s free count must see the freed allocation's
+    /// bytes show up here, not just silently vanish into the pool).
+    /// `mem_get_info`'s own driver-visible free count is asserted
+    /// UNCHANGED across the alloc+drop (within a small tolerance for
+    /// unrelated background allocations) -- the whole point of this method
+    /// is that the pool's reuse headroom is invisible to `mem_get_info`,
+    /// so if the free count moved by roughly the same 256 MiB instead,
+    /// this device is not actually pool-backed and the test's own premise
+    /// does not hold.
+    #[test]
+    #[ignore = "requires a real CUDA device; not available on this build host"]
+    fn alloc_and_drop_256_mib_leaves_it_reusable_in_the_pool() {
+        const MIB_256_F32_ELEMS: usize = (256 * 1024 * 1024) / std::mem::size_of::<f32>();
+
+        let dev = CudaDevice::new_with_stream(0).expect("CUDA device 0");
+        assert!(
+            dev.context.has_async_alloc(),
+            "this test requires a pool-backed (cuMemAllocAsync) device; \
+             CUDARC_DISABLE_ASYNC_ALLOC must be unset for this test to be meaningful"
+        );
+
+        let (free_before, _) = dev.mem_get_info().expect("mem_get_info before alloc");
+        let slice = dev.alloc_zeros::<f32>(MIB_256_F32_ELEMS).expect("256 MiB alloc_zeros");
+        drop(slice);
+        // Let the async free actually land before querying the pool --
+        // matches this file's own `device.synchronize()` convention
+        // elsewhere for "make sure a just-issued async op has completed
+        // before asserting on its effect."
+        dev.synchronize().expect("synchronize after drop");
+
+        let reusable = dev.mem_pool_reusable_bytes().expect("mem_pool_reusable_bytes");
+        assert!(
+            reusable >= 256 * 1024 * 1024,
+            "expected at least 256 MiB reusable in the pool after dropping a 256 MiB allocation, got {reusable} bytes"
+        );
+
+        let (free_after, _) = dev.mem_get_info().expect("mem_get_info after alloc+drop");
+        let tolerance = 16 * 1024 * 1024; // unrelated background driver bookkeeping
+        assert!(
+            free_after.abs_diff(free_before) <= tolerance,
+            "mem_get_info's driver-visible free count should stay roughly unchanged across a pool-backed \
+             alloc+drop (the freed bytes go to the POOL, not back to the driver) -- before={free_before} \
+             after={free_after}"
+        );
+    }
+
+    /// [Unit, ignored without a real GPU] With the async allocator
+    /// disabled (`CUDARC_DISABLE_ASYNC_ALLOC` set), there is no pool to
+    /// query -- `mem_pool_reusable_bytes` must return `Ok(0)`, never an
+    /// error, regardless of real allocation activity.
+    #[test]
+    #[ignore = "requires a real CUDA device with CUDARC_DISABLE_ASYNC_ALLOC set; not exercised on this build host"]
+    fn returns_zero_when_async_alloc_disabled() {
+        // SAFETY: test-only env mutation, single-threaded by `#[ignore]`
+        // convention for this whole module (never run under the default
+        // parallel test runner alongside a device that expects async
+        // alloc to stay enabled).
+        unsafe {
+            std::env::set_var("CUDARC_DISABLE_ASYNC_ALLOC", "1");
+        }
+        let dev = CudaDevice::new_with_stream(0).expect("CUDA device 0");
+        assert!(!dev.context.has_async_alloc(), "CUDARC_DISABLE_ASYNC_ALLOC must force has_async_alloc() false");
+        assert_eq!(dev.mem_pool_reusable_bytes().expect("must not error"), 0);
+        unsafe {
+            std::env::remove_var("CUDARC_DISABLE_ASYNC_ALLOC");
+        }
     }
 }
 
