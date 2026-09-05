@@ -10,6 +10,7 @@ use cudarc::driver::{
     CudaSlice, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
 use half::{bf16, f16};
+use std::sync::Arc;
 
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
@@ -21,14 +22,21 @@ pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
 pub enum SlicePtrOrNull<T> {
-    Ptr(CudaSlice<T>),
+    // `Arc`, not a bare `CudaSlice<T>` (kona issue #4366): the only real
+    // producer of this variant is `CudaDevice::clone_htod_capture_safe`,
+    // which now returns `Arc<CudaSlice<usize>>` so its own content-keyed
+    // cache can hand out a shared reference to an existing upload instead
+    // of a fresh owned allocation on every call -- `CudaSlice` has no
+    // cheap `Clone`, so unwrapping the `Arc` back to a bare `CudaSlice`
+    // here is not an option once the value may be shared.
+    Ptr(Arc<CudaSlice<T>>),
     Null,
 }
 
 impl<T: DeviceRepr> SlicePtrOrNull<T> {
     pub fn builder_arg<'a, 'b: 'a>(&'b self, builder: &mut cudarc::driver::LaunchArgs<'a>) {
         match self {
-            SlicePtrOrNull::Ptr(slice) => builder.arg(slice),
+            SlicePtrOrNull::Ptr(slice) => builder.arg(slice.as_ref()),
             SlicePtrOrNull::Null => builder.arg(&0usize),
         };
     }
@@ -199,7 +207,7 @@ impl Map1 for Im2Col1D {
         barg!(builder, self.stride);
         barg!(builder, self.padding);
         barg!(builder, self.dilation);
-        builder.arg(&ds);
+        builder.arg(ds.as_ref());
         builder.arg(src);
         builder.arg(&dst);
         // SAFETY: ffi.
@@ -252,7 +260,7 @@ impl Map1 for Im2Col {
         barg!(builder, self.stride);
         barg!(builder, self.padding);
         barg!(builder, self.dilation);
-        builder.arg(&ds);
+        builder.arg(ds.as_ref());
         builder.arg(src);
         builder.arg(&dst);
         // SAFETY: ffi.
@@ -350,7 +358,7 @@ impl Map1Any for FastReduce<'_> {
             barg!(builder, src_el);
             barg!(builder, el_to_sum_per_block);
             barg!(builder, src_dims.len());
-            builder.arg(&ds);
+            builder.arg(ds.as_ref());
             builder.arg(src);
             builder.arg(&out);
             // SAFETY: ffi.
@@ -363,7 +371,7 @@ impl Map1Any for FastReduce<'_> {
             barg!(builder, src_el);
             barg!(builder, el_to_sum_per_block);
             barg!(builder, src_dims.len());
-            builder.arg(&ds);
+            builder.arg(ds.as_ref());
             builder.arg(src);
             builder.arg(&out);
             // SAFETY: ffi.
@@ -446,7 +454,7 @@ impl Map1 for IndexSelect<'_> {
         let mut builder = func.builder();
         barg!(builder, dst_el);
         barg!(builder, ids_dims.len());
-        builder.arg(&ds);
+        builder.arg(ds.as_ref());
         barg!(builder, ids);
         builder.arg(&src);
         builder.arg(&out);
@@ -1077,7 +1085,7 @@ impl Map2 for WhereCond<'_> {
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, dims.len());
-        builder.arg(&ds);
+        builder.arg(ds.as_ref());
         barg!(builder, ids);
         builder.arg(t);
         builder.arg(f);

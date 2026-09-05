@@ -355,6 +355,53 @@ pub struct CudaDevice {
     /// the same order the dry run populated it, so the real capture
     /// pass's Nth call reuses the dry run's Nth buffer.
     pinned_scratch_cursor: Arc<std::sync::atomic::AtomicUsize>,
+    /// Content-keyed cache of the small `[dims, stride(s)...]` metadata
+    /// arrays [`Self::clone_htod_capture_safe`] uploads on the plain
+    /// (non-capturing) path -- see that method's own doc comment for
+    /// why this cache is safe to add there specifically: every real
+    /// call site in this crate passes shape/stride metadata for the
+    /// CURRENT tensor layout, which is a pure function of the tensor's
+    /// shape and is therefore IDENTICAL across repeated calls at the
+    /// same shape (e.g. one prefill chunk after another, same kv_len
+    /// class, same head count). A real trace (kona issue #4366) found
+    /// 16,704 of 18,223 `cuMemcpyHtoDAsync` calls in one 10k-token
+    /// prefill were exactly these sub-100-byte metadata uploads, almost
+    /// entirely re-uploading the SAME handful of distinct layouts
+    /// thousands of times. Values here are immutable once inserted (the
+    /// key IS the content), so there is no invalidation to reason
+    /// about -- only growth, bounded by
+    /// [`HTOD_INFO_CACHE_CAP`](self::HTOD_INFO_CACHE_CAP). Entries are
+    /// `Arc`-shared rather than cloned per hit: [`cudarc::driver::CudaSlice`]
+    /// has no cheap `Clone` (only `try_clone`, a real device-to-device
+    /// copy), so a cache hit hands out a new reference to the SAME
+    /// device allocation instead of copying it.
+    htod_info_cache: Arc<Mutex<HashMap<Vec<usize>, Arc<cudarc::driver::CudaSlice<usize>>>>>,
+}
+
+/// Hard cap on [`CudaDevice::htod_info_cache`]'s entry count. Entries are
+/// tens of bytes of device memory each (this cache exists specifically
+/// for SMALL metadata arrays, never real tensor data), so a cap of a few
+/// thousand bounds total cache footprint at well under 1 MiB while
+/// comfortably covering every distinct shape/stride layout one model's
+/// real serving traffic produces (a model has a small, fixed number of
+/// tensor ranks and a bounded set of `kv_len`-driven shapes per prefill
+/// chunk boundary -- not one entry per token). Once full, the cache
+/// stops GROWING but keeps serving existing entries; it does not evict,
+/// so a live model's already-cached layouts never get silently
+/// re-uploaded because a different, unrelated shape happened to fill the
+/// cap first -- a fresh (uncached) upload for a layout past the cap is
+/// correct, just not accelerated, never wrong.
+const HTOD_INFO_CACHE_CAP: usize = 4096;
+
+/// Whether [`CudaDevice::clone_htod_capture_safe`]'s content-keyed cache
+/// is active on the plain (non-capturing) path. Read once and cached in
+/// a `OnceLock`, matching this file's own `CEREBRA_ARENA_DEBUG` /
+/// `CEREBRA_*` env-gate convention elsewhere in this crate. Default ON;
+/// set to `"0"` to bypass (e.g. to isolate whether a regression is
+/// caused by this cache versus something else).
+fn htod_info_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CEREBRA_HTOD_INFO_CACHE").ok().as_deref() != Some("0"))
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -532,7 +579,7 @@ impl CudaDevice {
     /// poison it, wedging every later allocation on the device --
     /// confirmed live 2026-08-28). The capture closure then fails
     /// cleanly and the caller falls back to eager decode.
-    pub fn clone_htod_capture_safe(&self, data: &[usize]) -> Result<cudarc::driver::CudaSlice<usize>> {
+    pub fn clone_htod_capture_safe(&self, data: &[usize]) -> Result<Arc<cudarc::driver::CudaSlice<usize>>> {
         let mode = self.alloc_mode.load(std::sync::atomic::Ordering::Relaxed);
         if mode == AllocMode::Measuring as u8 && self.is_current_thread_capturing() {
             // SAFETY: written in full immediately below, before any
@@ -552,7 +599,13 @@ impl CudaDevice {
             let mut dst = unsafe { self.alloc::<usize>(data.len()) }?;
             self.memcpy_htod(&pinned, &mut dst)?;
             self.pinned_scratch.lock().unwrap().push(pinned);
-            return Ok(dst);
+            // Not cached here: capture-mode dry-run/replay behavior stays
+            // exactly as it was before this cache existed (per this
+            // method's own doc comment above, the capture arena's own
+            // measure-then-replay mechanism already avoids redundant
+            // uploads for the real capture pass -- this cache is
+            // specifically for the plain, non-capturing path below).
+            return Ok(Arc::new(dst));
         }
         if mode == AllocMode::Arena as u8 && self.is_current_thread_capturing() {
             let idx = self.pinned_scratch_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -602,9 +655,29 @@ impl CudaDevice {
             // on every launch) before the step's kernels read it.
             let mut dst = unsafe { self.alloc::<usize>(data.len()) }?;
             self.active_stream().memcpy_htod(&*pinned, &mut dst).w()?;
-            return Ok(dst);
+            // Not cached here either, same reasoning as the Measuring
+            // branch above.
+            return Ok(Arc::new(dst));
         }
-        self.clone_htod(data)
+        if htod_info_cache_enabled() {
+            if let Some(existing) = self.htod_info_cache.lock().unwrap().get(data) {
+                return Ok(Arc::clone(existing));
+            }
+            let fresh = Arc::new(self.clone_htod(data)?);
+            let mut cache = self.htod_info_cache.lock().unwrap();
+            if cache.len() < HTOD_INFO_CACHE_CAP {
+                // Re-check under the same lock: two threads could both
+                // have missed the lookup above and raced to upload the
+                // same content. Whichever inserts first wins; the other's
+                // freshly uploaded (but now-redundant) buffer is simply
+                // dropped -- correct either way, since both buffers hold
+                // identical content and only one needs to survive in the
+                // cache.
+                cache.entry(data.to_vec()).or_insert_with(|| Arc::clone(&fresh));
+            }
+            return Ok(fresh);
+        }
+        Ok(Arc::new(self.clone_htod(data)?))
     }
 }
 
@@ -996,6 +1069,7 @@ impl CudaDevice {
             capturing_thread: Arc::new(Mutex::new(None)),
             pinned_scratch: Arc::new(Mutex::new(Vec::new())),
             pinned_scratch_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            htod_info_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1302,6 +1376,7 @@ impl BackendDevice for CudaDevice {
             capturing_thread: Arc::new(Mutex::new(None)),
             pinned_scratch: Arc::new(Mutex::new(Vec::new())),
             pinned_scratch_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            htod_info_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1717,6 +1792,94 @@ impl BackendDevice for CudaDevice {
     fn synchronize(&self) -> Result<()> {
         self.stream.synchronize().map_err(crate::Error::wrap)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod htod_info_cache_tests {
+    use super::CudaDevice;
+    use cudarc::driver::DevicePtr;
+
+    /// [Unit, ignored without a real GPU] Two calls with identical
+    /// content return the SAME device allocation (checked via the
+    /// device pointer address, not the Rust struct address, which
+    /// always differs since each `Arc::clone` returns a new `Arc`
+    /// pointer even when the underlying `CudaSlice` is shared).
+    #[test]
+    #[ignore = "requires a real CUDA device; not available on this build host"]
+    fn same_contents_twice_returns_the_same_device_pointer() {
+        let dev = CudaDevice::new_with_stream(0).expect("CUDA device 0");
+        let a = dev.clone_htod_capture_safe(&[4, 8, 1, 1]).expect("first upload");
+        let b = dev.clone_htod_capture_safe(&[4, 8, 1, 1]).expect("second upload, should be a cache hit");
+        assert_eq!(
+            a.device_ptr(&dev.cuda_stream()).0,
+            b.device_ptr(&dev.cuda_stream()).0,
+            "identical content must hand out the same device allocation, not a fresh upload"
+        );
+    }
+
+    /// [Unit, ignored without a real GPU] Two calls with DIFFERENT
+    /// content must never alias the same device allocation.
+    #[test]
+    #[ignore = "requires a real CUDA device; not available on this build host"]
+    fn different_contents_returns_different_device_pointers() {
+        let dev = CudaDevice::new_with_stream(0).expect("CUDA device 0");
+        let a = dev.clone_htod_capture_safe(&[4, 8, 1, 1]).expect("first upload");
+        let b = dev.clone_htod_capture_safe(&[4, 16, 1, 1]).expect("second, different-content upload");
+        assert_ne!(
+            a.device_ptr(&dev.cuda_stream()).0,
+            b.device_ptr(&dev.cuda_stream()).0,
+            "different content must never share a device allocation"
+        );
+    }
+
+    /// [Unit, ignored without a real GPU] Once `HTOD_INFO_CACHE_CAP`
+    /// distinct layouts have been cached, a further distinct layout is
+    /// still served correctly (a real, uncached upload) rather than
+    /// evicting or corrupting an existing entry -- the cache never grows
+    /// past the cap and never evicts what is already in it.
+    #[test]
+    #[ignore = "requires a real CUDA device; not available on this build host"]
+    fn cap_is_respected_without_corrupting_existing_entries() {
+        let dev = CudaDevice::new_with_stream(0).expect("CUDA device 0");
+        // Fill the cache past its cap with distinct single-element
+        // layouts, then confirm the FIRST entry inserted is still
+        // present and unchanged (proves no eviction happened), and that
+        // a fresh layout past the cap still succeeds (proves the cache
+        // fails open -- an uncached upload, not an error).
+        let first = dev.clone_htod_capture_safe(&[0]).expect("first entry");
+        for i in 1..=(super::HTOD_INFO_CACHE_CAP + 8) {
+            dev.clone_htod_capture_safe(&[i]).expect("fill past the cap");
+        }
+        let first_again = dev.clone_htod_capture_safe(&[0]).expect("first entry, looked up again");
+        assert_eq!(
+            first.device_ptr(&dev.cuda_stream()).0,
+            first_again.device_ptr(&dev.cuda_stream()).0,
+            "an entry cached before the cap was reached must still be a cache hit afterward"
+        );
+        let past_cap = dev.clone_htod_capture_safe(&[usize::MAX]).expect("a layout past the cap must still succeed");
+        assert_eq!(past_cap.len(), 1);
+    }
+
+    /// [Unit, ignored without a real GPU] The capture-mode branches
+    /// (`AllocMode::Measuring` / `AllocMode::Arena`) are entirely
+    /// untouched by this cache -- confirmed by reading the source above:
+    /// both branches `return` before ever reaching the
+    /// `htod_info_cache` lookup, which only exists after both `if`
+    /// blocks. This test exercises the plain (non-capturing) path twice
+    /// with the same content as a smoke check that ordinary, uncaptured
+    /// behavior (what every model load and eager decode step uses) is
+    /// unaffected by this change -- the real behavioral guarantee for
+    /// capture mode itself is structural (this cache's code is
+    /// unreachable from either capture branch), not something a runtime
+    /// test can observe without a live capture window.
+    #[test]
+    #[ignore = "requires a real CUDA device; not available on this build host"]
+    fn plain_path_still_returns_usable_data_outside_capture() {
+        let dev = CudaDevice::new_with_stream(0).expect("CUDA device 0");
+        let data = [7, 9, 11];
+        let uploaded = dev.clone_htod_capture_safe(&data).expect("plain-path upload");
+        assert_eq!(uploaded.len(), data.len());
     }
 }
 
