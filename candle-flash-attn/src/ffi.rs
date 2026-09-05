@@ -48,6 +48,14 @@ extern "C" {
         window_size_right: c_int,
 
         softcap: f32,
+
+        // Stream fix (2026-09-05): the kernel used to launch on the legacy
+        // default stream unconditionally, racing against candle's own
+        // non-blocking cudarc stream that produces its inputs and consumes
+        // its output. Callers now pass candle's real `CUstream` handle
+        // (`dev.cuda_stream().cu_stream()`) through explicitly -- see
+        // flash_api.cu's own matching comment for the root-cause writeup.
+        stream_ptr: *const c_void,
     );
 
 }

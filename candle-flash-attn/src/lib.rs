@@ -204,6 +204,7 @@ impl FlashAttn {
                 /* window_size_left */ window_size_left,
                 /* window_size_right */ window_size_right,
                 /* softcap */ self.softcap.unwrap_or(0f32),
+                /* stream_ptr */ stream.cu_stream() as *const core::ffi::c_void,
             )
         }
 
@@ -454,6 +455,7 @@ fn flash_attn_into_t<T: candle::cuda_backend::CudaDType + candle::cuda_backend::
             /* window_size_left */ window_size_left,
             /* window_size_right */ window_size_right,
             /* softcap */ 0f32,
+            /* stream_ptr */ stream.cu_stream() as *const core::ffi::c_void,
         )
     }
     Ok(())
@@ -912,6 +914,7 @@ impl FlashAttnVarLen {
                 /* window_size_left */ window_size_left,
                 /* window_size_right */ window_size_right,
                 /* softcap */ self.softcap.unwrap_or(0.0),
+                /* stream_ptr */ stream.cu_stream() as *const core::ffi::c_void,
             )
         }
 

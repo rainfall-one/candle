@@ -58,7 +58,18 @@ extern "C" void run_mha(
     int window_size_left,
     int window_size_right,
 
-    float softcap
+    float softcap,
+
+    // Stream fix (2026-09-05): this kernel used to launch on the legacy
+    // default stream (stream 0) unconditionally, while every candle op
+    // producing its inputs and consuming its output runs on candle's own
+    // cudarc stream -- created CU_STREAM_NON_BLOCKING, so nothing implicitly
+    // orders the two. Root-caused via a real hardware discriminator
+    // (CUDA_LAUNCH_BLOCKING=1 made repeated identical-input calls agree;
+    // without it, cold and warm calls diverged unpredictably even with
+    // every buffer made persistent). Caller now passes candle's real
+    // stream handle through explicitly.
+    void *stream_ptr
 ) {
     Flash_fwd_params params;
     // Reset the parameters
@@ -131,6 +142,6 @@ extern "C" void run_mha(
     params.num_splits = 1;
     params.unpadded_lse = unpadded_lse;
 
-    cudaStream_t stream = 0; // Use the default stream.
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     run_mha_fwd(params, stream);
 }
