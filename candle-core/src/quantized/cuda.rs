@@ -73,6 +73,41 @@ fn moe_grouped_min_tasks_from_raw(raw: Option<&str>) -> usize {
         .unwrap_or(1024)
 }
 
+/// Resolves `CEREBRA_MOE_GROUPED`'s per-dtype precedence for the tiled
+/// MMQ MoE tier -- pure and unit-testable (no CUDA, no env access),
+/// factored out of the three near-identical `match w_dtype` arms in
+/// [`indexed_moe_forward_fused_q8_1_input`] rather than duplicated per
+/// dtype.
+///
+/// `env` is the raw `CEREBRA_MOE_GROUPED` value; `task_count_gate` is
+/// [`moe_grouped_min_tasks`]'s own threshold check for this call;
+/// `this_dtype_key` is this dtype's own bisect string (e.g. `"q4k"`);
+/// `other_dtype_keys` are the sibling hot dtypes' bisect strings, which
+/// this dtype must be EXCLUDED for (correctness-bisection semantics: an
+/// operator forcing one dtype on is deliberately ruling the others
+/// out, not leaving them at their own default).
+///
+/// Precedence, in order: `""` (unset) defers to `task_count_gate` --
+/// the production default, no env needed. `"0"` is an explicit
+/// force-OFF (added after this enablement's supervisor review found it
+/// silently fell through to the SAME behavior as unset, which is not
+/// what an operator setting `"0"` would expect) -- task-major
+/// regardless of task count. `"1"` force-ON for every hot dtype at any
+/// task count. `this_dtype_key` force-ON for just this dtype.
+/// `other_dtype_keys` force-OFF (bisection exclusion). Anything else
+/// unrecognized falls back to `task_count_gate`, same as unset -- an
+/// operator typo should not silently disable the tier either.
+fn mmq_dtype_eligible(env: &str, task_count_gate: bool, this_dtype_key: &str, other_dtype_keys: &[&str]) -> bool {
+    match env {
+        "" => task_count_gate,
+        "0" => false,
+        "1" => true,
+        key if key == this_dtype_key => true,
+        key if other_dtype_keys.contains(&key) => false,
+        _ => task_count_gate,
+    }
+}
+
 fn quantize_q8_1(
     src: &CudaView<f32>,
     dst: &mut CudaSlice<u8>,
@@ -932,30 +967,12 @@ fn indexed_moe_forward_fused_q8_1_input(
     let moe_grouped_env = std::env::var("CEREBRA_MOE_GROUPED").unwrap_or_default();
     let task_count_gate = total_tasks >= moe_grouped_min_tasks();
     let mmq_eligible_dtype = match w_dtype {
-        GgmlDType::Q4K => match moe_grouped_env.as_str() {
-            "" => task_count_gate,
-            "1" => true,
-            "q4k" => true,
-            "q5k" | "q6k" => false,
-            _ => task_count_gate,
-        },
-        GgmlDType::Q5K => match moe_grouped_env.as_str() {
-            "" => task_count_gate,
-            "1" => true,
-            "q5k" => true,
-            "q4k" | "q6k" => false,
-            _ => task_count_gate,
-        },
+        GgmlDType::Q4K => mmq_dtype_eligible(&moe_grouped_env, task_count_gate, "q4k", &["q5k", "q6k"]),
+        GgmlDType::Q5K => mmq_dtype_eligible(&moe_grouped_env, task_count_gate, "q5k", &["q4k", "q6k"]),
         // Step 2 of the Goal-2500 campaign (2026-08-30): Q6K down
         // projections through the same tiled MMQ path. "q6k" bisects
         // independently of Q4K/Q5K for correctness isolation.
-        GgmlDType::Q6K => match moe_grouped_env.as_str() {
-            "" => task_count_gate,
-            "1" => true,
-            "q6k" => true,
-            "q4k" | "q5k" => false,
-            _ => task_count_gate,
-        },
+        GgmlDType::Q6K => mmq_dtype_eligible(&moe_grouped_env, task_count_gate, "q6k", &["q4k", "q5k"]),
         _ => false,
     };
     let mmq_moe = mmq_eligible_dtype;
@@ -995,11 +1012,16 @@ fn indexed_moe_forward_fused_q8_1_input(
         && matches!(w_dtype, GgmlDType::Q8_0);
     // Dispatch trace (2026-09-05, CEREBRA_MOE_TIER_TRACE=1): prints the
     // resolved tier for every indexed-MoE call -- the precedence-audit
-    // instrument for the task-count-gate enablement above. Cheap enough
-    // to leave in permanently behind the env gate, same convention as
-    // CEREBRA_MMQ_MMA_TRACE/CEREBRA_GRAPH_NODE_AUDIT elsewhere in this
-    // file.
-    if !std::env::var("CEREBRA_MOE_TIER_TRACE").unwrap_or_default().is_empty() {
+    // instrument for the task-count-gate enablement above. The env
+    // lookup is checked ONCE per process (`OnceLock`, supervisor review
+    // of this enablement, round 2: this is a per-launch hot path, a
+    // string env read on every call is real per-call cost even when
+    // tracing is off) -- the branch below then costs one atomic load
+    // plus a boolean check when disabled, not a string parse.
+    static MOE_TIER_TRACE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *MOE_TIER_TRACE_ENABLED
+        .get_or_init(|| !std::env::var("CEREBRA_MOE_TIER_TRACE").unwrap_or_default().is_empty())
+    {
         let tier = if mma_moe {
             "mma_moe"
         } else if mmq_moe {
@@ -1867,6 +1889,38 @@ mod test {
              ({min_tasks}), or the tier would default-engage at the scale it was originally \
              a measured, real win"
         );
+    }
+
+    /// [Unit] Full precedence truth table for [`mmq_dtype_eligible`]
+    /// (enablement round 2, supervisor's precedence audit on #4348):
+    /// `""` defers to the task-count gate, `"0"` force-disables
+    /// regardless of task count (added specifically because it used to
+    /// silently fall through to the SAME behavior as unset -- an
+    /// operator setting it would not have gotten what they asked for),
+    /// `"1"` force-enables, this dtype's own bisect key force-enables,
+    /// a sibling dtype's key force-disables, and anything unrecognized
+    /// falls back to the task-count gate rather than silently
+    /// disabling.
+    #[test]
+    fn unit_mmq_dtype_eligible_full_precedence_table() {
+        let others = ["q5k", "q6k"];
+        // task_count_gate=true cases:
+        assert!(mmq_dtype_eligible("", true, "q4k", &others), "unset defers to the gate");
+        assert!(mmq_dtype_eligible("1", true, "q4k", &others), "\"1\" force-enables");
+        assert!(mmq_dtype_eligible("q4k", true, "q4k", &others), "own key force-enables");
+        assert!(
+            mmq_dtype_eligible("unrecognized-typo", true, "q4k", &others),
+            "unrecognized value defers to the gate, does not silently disable"
+        );
+        // task_count_gate=false cases:
+        assert!(!mmq_dtype_eligible("", false, "q4k", &others), "unset defers to the gate");
+        assert!(mmq_dtype_eligible("1", false, "q4k", &others), "\"1\" force-enables regardless of the gate");
+        assert!(mmq_dtype_eligible("q4k", false, "q4k", &others), "own key force-enables regardless of the gate");
+        // "0" and sibling-exclusion force-disable REGARDLESS of the gate:
+        assert!(!mmq_dtype_eligible("0", true, "q4k", &others), "\"0\" force-disables even when the gate is true");
+        assert!(!mmq_dtype_eligible("0", false, "q4k", &others), "\"0\" force-disables when the gate is false too");
+        assert!(!mmq_dtype_eligible("q5k", true, "q4k", &others), "a sibling's key excludes this dtype even when the gate is true");
+        assert!(!mmq_dtype_eligible("q6k", true, "q4k", &others), "the OTHER sibling's key excludes this dtype too");
     }
 
     #[test]
