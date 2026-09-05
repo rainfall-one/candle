@@ -247,41 +247,35 @@ impl candle::CustomOp3 for FlashAttn {
     }
 }
 
-// Alias-bug fix (2026-09-05, second instance of the ca89ad37 defect
-// class -- see that commit's own header comment in
-// `candle-core/src/quantized/cuda.rs` for the full root-cause writeup):
-// this fork's `cuMemAllocAsync` pool allocator is unreliable on the
-// A100-40GB/VMware-passthrough/driver-610.57.04/CUDA-13.3.1 combination
-// -- a kernel's own scatter-write into a freshly-cycled pool buffer can
-// silently receive wrong data. `FlashAttn::cuda_fwd_t` (above) allocates
-// its `dst` output fresh on every call via `unsafe { dev.alloc }`,
-// exactly the pattern `ca89ad37` fixed for `indexed_moe_forward`.
+// Real-world cold/warm divergence, root cause and fix (2026-09-05): the
+// actual defect was `run_mha` launching on the legacy default CUDA
+// stream, unordered against candle's own non-blocking cudarc stream --
+// see `flash_api.cu`'s own comment on the `stream_ptr` parameter for the
+// full writeup. Proven by elimination on real hardware first: making
+// every buffer here persistent (both `dst` and `softmax_lse`, below) did
+// NOT fix the divergence, ruling out a `cuMemAllocAsync`-class alias
+// defect; `CUDA_LAUNCH_BLOCKING=1` then made repeated calls agree,
+// pointing straight at stream ordering, confirmed by threading the real
+// stream through the FFI boundary.
 //
-// Two different fixes for the two different buffers here, because they
-// have different ownership shapes:
+// The two persistent buffers below are retained regardless, as a
+// worthwhile precaution and a real per-call allocation saving on this
+// driver -- NOT as the fix for the divergence itself:
 //
-// `dst` (the real output, returned to the caller): CANNOT use `ca89ad37`'s
-// own workspace trick directly -- that trick works by having the callER
-// see a `Tensor::narrow()` VIEW into a persistent Arc<Storage>, which
-// requires the call site to go through `Tensor`-level ops, not
-// `CustomOp3::cuda_fwd`'s fixed `Result<(CudaStorage, Shape)>` return
-// type (a raw `CudaStorage` handed out fresh every call, by the trait's
-// own contract, has no non-owning-view story). Fix here instead: `out`
-// is now the CALLER's own responsibility -- [`flash_attn_into`] writes
-// directly into a `Tensor` the caller allocates ONCE and reuses across
-// calls (exactly the persistent-buffer principle, just relocated to
-// where the ownership already naturally lives). [`flash_attn`] keeps its
-// existing behavior unchanged (allocates fresh every call via the
-// existing `cuda_fwd_t`/`CustomOp3` path) -- this is an ADDITIVE API,
-// not a change to the default one.
+// `dst` (the real output, returned to the caller): [`flash_attn_into`]
+// writes directly into a `Tensor` the caller allocates ONCE and reuses
+// across calls, avoiding a fresh per-call allocation. [`flash_attn`]
+// keeps its existing behavior unchanged (allocates fresh every call via
+// the existing `cuda_fwd_t`/`CustomOp3` path) -- this is an ADDITIVE
+// API, not a change to the default one.
 //
 // `softmax_lse` (an internal scratch buffer this crate's own callers
-// never read): DOES use `ca89ad37`'s exact workspace pattern -- a
-// persistent, per-(device,stream) `CudaSlice<f32>`, grown-not-shrunk,
-// reused across every call. This mirrors that commit's own treatment of
-// MoE's `input_quant` scratch buffer ("stays a raw persistent
-// CudaSlice<u8>, never returned to the caller, no ownership conflict to
-// solve") -- the identical situation here.
+// never read): a persistent, per-(device,stream) `CudaSlice<f32>`,
+// grown-not-shrunk, reused across every call -- the same allocation-
+// avoidance shape `ca89ad37` used for MoE's `input_quant` scratch
+// buffer, applied here as a precaution against this driver's known
+// `cuMemAllocAsync` pool-allocator defect class, not because it was
+// found to cause this particular bug.
 struct FlashLseWorkspaceEntry {
     lse: candle::cuda_backend::cudarc::driver::CudaSlice<f32>,
     capacity: usize, // f32 elements
