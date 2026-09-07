@@ -876,6 +876,22 @@ impl CudaDevice {
     /// a caller wanting the pool's memory back for a DIFFERENT purpose is
     /// a distinct, explicit decision this method does not make on its
     /// own.
+    ///
+    /// **Sensitive to `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD`, which neither
+    /// this fork nor the pinned `cudarc` fork
+    /// (`rainfall-async-alloc-toggle`) ever raises above the CUDA
+    /// driver's own default of `0`** (confirmed by grepping both for
+    /// `RELEASE_THRESHOLD`/`cuMemPoolSetAttribute`, 2026-09-07): at
+    /// threshold `0`, a stream synchronize is a point at which the
+    /// driver is free to release pool memory back to itself rather than
+    /// retain it, so a caller that synchronizes between freeing an
+    /// allocation and calling this method may see a much smaller number
+    /// than the allocation it just freed (confirmed live on real
+    /// hardware: `dev.synchronize()` before this call measured ~32 MiB
+    /// reusable after freeing 256 MiB). Calling this immediately after a
+    /// free, with no intervening synchronize, is the representative
+    /// case this method's own real consumer (`batch_engine.rs::admit`'s
+    /// headroom check) actually exercises.
     pub fn mem_pool_reusable_bytes(&self) -> Result<usize> {
         if !self.context.has_async_alloc() {
             return Ok(0);
@@ -1962,6 +1978,23 @@ mod mem_pool_reusable_bytes_tests {
     /// so if the free count moved by roughly the same 256 MiB instead,
     /// this device is not actually pool-backed and the test's own premise
     /// does not hold.
+    ///
+    /// **Deliberately does NOT call `device.synchronize()` before the
+    /// query** (an earlier version of this test did, and failed on real
+    /// hardware: measured ~32 MiB reusable, not >= 256 MiB). Root cause,
+    /// confirmed by grepping both this fork and the pinned `cudarc` fork
+    /// (`rainfall-async-alloc-toggle`) for `RELEASE_THRESHOLD`/
+    /// `cuMemPoolSetAttribute`: neither ever raises
+    /// `CU_MEMPOOL_ATTR_RELEASE_THRESHOLD` above the CUDA driver's own
+    /// default of `0`, so a stream synchronize is exactly the point at
+    /// which the driver is free to release pool memory back rather than
+    /// retain it for reuse -- calling `synchronize()` before the query
+    /// was testing the wrong moment, not a flaky assertion. Querying
+    /// immediately after `drop` (relying only on the free's own stream-
+    /// ordering, no explicit sync) is also the MORE representative case:
+    /// `batch_engine.rs::admit`'s real headroom check (the actual
+    /// consumer this method exists for) never synchronizes before
+    /// calling `mem_get_info`/`mem_pool_reusable_bytes` either.
     #[test]
     #[ignore = "requires a real CUDA device; not available on this build host"]
     fn alloc_and_drop_256_mib_leaves_it_reusable_in_the_pool() {
@@ -1977,16 +2010,13 @@ mod mem_pool_reusable_bytes_tests {
         let (free_before, _) = dev.mem_get_info().expect("mem_get_info before alloc");
         let slice = dev.alloc_zeros::<f32>(MIB_256_F32_ELEMS).expect("256 MiB alloc_zeros");
         drop(slice);
-        // Let the async free actually land before querying the pool --
-        // matches this file's own `device.synchronize()` convention
-        // elsewhere for "make sure a just-issued async op has completed
-        // before asserting on its effect."
-        dev.synchronize().expect("synchronize after drop");
 
         let reusable = dev.mem_pool_reusable_bytes().expect("mem_pool_reusable_bytes");
         assert!(
             reusable >= 256 * 1024 * 1024,
-            "expected at least 256 MiB reusable in the pool after dropping a 256 MiB allocation, got {reusable} bytes"
+            "expected at least 256 MiB reusable in the pool after dropping a 256 MiB allocation, got {reusable} bytes \
+             (if this regresses again, check whether RELEASE_THRESHOLD has since been raised somewhere -- see this \
+             test's own doc comment for why that would change what 'immediately after drop' actually observes)"
         );
 
         let (free_after, _) = dev.mem_get_info().expect("mem_get_info after alloc+drop");
